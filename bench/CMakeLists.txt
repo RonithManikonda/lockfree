@@ -21,5 +21,5 @@ set(LOCKFREE_BENCHMARKS
 
 foreach(bench ${LOCKFREE_BENCHMARKS})
   add_executable(${bench} ${bench}.cpp)
-  target_link_libraries(${bench} PRIVATE lockfree benchmark::benchmark)
+  target_link_libraries(${bench} PRIVATE lockfree benchmark::benchmark_main)
 endforeach()
