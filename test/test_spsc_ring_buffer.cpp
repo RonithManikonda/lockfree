@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
+#include <stdexcept>
+#include <string>
 #include <thread>
 
 #include "lockfree/spsc_ring_buffer.hpp"
@@ -125,6 +128,66 @@ TEST(SpscRingBuffer, InterleavedSinglePushPop) {
         EXPECT_EQ(v, i);
         EXPECT_TRUE(q.empty_approx());
     }
+}
+
+// ---- Element types beyond int ----------------------------------------------
+
+TEST(SpscRingBuffer, MoveOnlyElements) {
+    SpscRingBuffer<std::unique_ptr<int>, 4> q;
+    ASSERT_TRUE(q.try_push(std::make_unique<int>(1)));
+    ASSERT_TRUE(q.try_emplace(new int(2)));
+
+    std::unique_ptr<int> out;
+    ASSERT_TRUE(q.try_pop(out));
+    ASSERT_NE(out, nullptr);
+    EXPECT_EQ(*out, 1);
+
+    std::optional<std::unique_ptr<int>> opt = q.try_pop();
+    ASSERT_TRUE(opt.has_value());
+    EXPECT_EQ(**opt, 2);
+    EXPECT_FALSE(q.try_pop().has_value());
+}
+
+TEST(SpscRingBuffer, NoDefaultConstructorNeeded) {
+    struct Pair {
+        Pair(int a, std::string b) : a(a), b(std::move(b)) {}
+        int a;
+        std::string b;
+    };
+    static_assert(!std::is_default_constructible_v<Pair>);
+
+    SpscRingBuffer<Pair, 2> q;
+    ASSERT_TRUE(q.try_emplace(1, "one"));
+    ASSERT_TRUE(q.try_emplace(2, std::string(40, 'x'))); // past SSO, heap-allocated
+    EXPECT_FALSE(q.try_emplace(3, "three"));
+
+    auto first = q.try_pop();
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->a, 1);
+    EXPECT_EQ(first->b, "one");
+    auto second = q.try_pop();
+    ASSERT_TRUE(second);
+    EXPECT_EQ(second->b.size(), 40u);
+}
+
+TEST(SpscRingBuffer, ThrowingConstructorLeavesQueueUnchanged) {
+    struct Picky {
+        explicit Picky(int v) : v(v) {
+            if (v < 0) throw std::invalid_argument("negative");
+        }
+        int v;
+    };
+
+    SpscRingBuffer<Picky, 4> q;
+    ASSERT_TRUE(q.try_emplace(7));
+    EXPECT_THROW(q.try_emplace(-1), std::invalid_argument);
+    EXPECT_EQ(q.size_approx(), 1u);
+
+    // The slot the failed emplace targeted is still usable.
+    ASSERT_TRUE(q.try_emplace(8));
+    EXPECT_EQ(q.try_pop()->v, 7);
+    EXPECT_EQ(q.try_pop()->v, 8);
+    EXPECT_FALSE(q.try_pop());
 }
 
 // ---- Two threads -----------------------------------------------------------

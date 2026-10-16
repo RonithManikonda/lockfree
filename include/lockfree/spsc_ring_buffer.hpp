@@ -1,6 +1,10 @@
 #pragma once
 #include <atomic>
 #include <cstddef>
+#include <new>
+#include <optional>
+#include <type_traits>
+#include <utility>
 
 #include "lockfree/detail/cache_line.hpp"
 
@@ -16,34 +20,82 @@ namespace lockfree {
 //
 // Invariant: 0 <= write_ - read_ <= N. Only the producer stores write_, only
 // the consumer stores read_.
+//
+// Slots are raw storage, not T objects. A slot holds a live T exactly when its
+// counter value is in [read_, write_): push constructs into it before
+// publishing write_, pop destroys it before publishing read_. So T needs no
+// default constructor, and nothing is constructed for empty slots.
 template <typename T, std::size_t N>
 class SpscRingBuffer {
     static_assert(N >= 2, "capacity must be at least 2");
     static_assert((N & (N - 1)) == 0, "capacity must be a power of two");
+    static_assert(std::is_nothrow_destructible_v<T>,
+                  "pop and the destructor can't recover from a throwing ~T");
 
 public:
-    // Producer only.
-    bool try_push(const T& item) {
+    SpscRingBuffer() = default;
+    SpscRingBuffer(const SpscRingBuffer&) = delete;
+    SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
+
+    // Destroys whatever was pushed and never popped. Must not race with
+    // either side, like any destructor.
+    ~SpscRingBuffer() {
+        const std::size_t w = write_.load(std::memory_order_relaxed);
+        for (std::size_t r = read_.load(std::memory_order_relaxed); r != w; ++r) {
+            slot(r)->~T();
+        }
+    }
+
+    // Producer only. Constructs the element in place. If T's constructor
+    // throws, nothing was published and the queue is unchanged.
+    template <typename... Args>
+    bool try_emplace(Args&&... args) noexcept(
+        std::is_nothrow_constructible_v<T, Args&&...>) {
         const std::size_t w = write_.load(std::memory_order_relaxed);
         // acquire pairs with the consumer's release store of read_: once we
-        // see the slot as free, the consumer's read of it has finished.
+        // see the slot as free, the consumer's destruction of the old element
+        // has finished and we can construct over it.
         if (w - read_.load(std::memory_order_acquire) == N) return false;
-        buffer_[w & mask] = item;
-        // release publishes the slot contents before the new count.
+        ::new (static_cast<void*>(storage(w))) T(std::forward<Args>(args)...);
+        // release publishes the constructed element before the new count.
         write_.store(w + 1, std::memory_order_release);
         return true;
     }
 
-    // Consumer only.
-    bool try_pop(T& out) {
+    bool try_push(const T& item) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+        return try_emplace(item);
+    }
+
+    bool try_push(T&& item) noexcept(std::is_nothrow_move_constructible_v<T>) {
+        return try_emplace(std::move(item));
+    }
+
+    // Consumer only. Move-assigns into `out`. If that throws, the element
+    // stays in the queue (the slot isn't released).
+    bool try_pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
         const std::size_t r = read_.load(std::memory_order_relaxed);
         // acquire pairs with the producer's release store of write_, so the
-        // slot write is visible before we read it.
+        // constructed element is visible before we touch it.
         if (r == write_.load(std::memory_order_acquire)) return false;
-        out = buffer_[r & mask];
-        // release: our read of the slot happens-before the producer reuses it.
+        T* p = slot(r);
+        out = std::move(*p);
+        p->~T();
+        // release: our read and destruction of the slot happen-before the
+        // producer constructs into it again.
         read_.store(r + 1, std::memory_order_release);
         return true;
+    }
+
+    // Consumer only. Works for types that aren't default-constructible or
+    // assignable, at the cost of an optional.
+    std::optional<T> try_pop() noexcept(std::is_nothrow_move_constructible_v<T>) {
+        const std::size_t r = read_.load(std::memory_order_relaxed);
+        if (r == write_.load(std::memory_order_acquire)) return std::nullopt;
+        T* p = slot(r);
+        std::optional<T> out(std::move(*p));
+        p->~T();
+        read_.store(r + 1, std::memory_order_release);
+        return out;
     }
 
     static constexpr std::size_t capacity() noexcept { return N; }
@@ -65,11 +117,23 @@ public:
 private:
     static constexpr std::size_t mask = N - 1;
 
+    struct Slot {
+        alignas(T) std::byte bytes[sizeof(T)];
+    };
+
+    void* storage(std::size_t index) noexcept { return buffer_[index & mask].bytes; }
+
+    // launder: the bytes are reused for a new T each lap, so a plain cast
+    // would let the compiler assume it still points at the old object.
+    T* slot(std::size_t index) noexcept {
+        return std::launder(static_cast<T*>(storage(index)));
+    }
+
     // Each index on its own line so the producer and consumer don't
     // invalidate each other's cache line on every operation.
     alignas(detail::cache_line_size) std::atomic<std::size_t> read_{0};
     alignas(detail::cache_line_size) std::atomic<std::size_t> write_{0};
-    alignas(detail::cache_line_size) T buffer_[N];
+    alignas(detail::cache_line_size) Slot buffer_[N];
 };
 
 } // namespace lockfree
