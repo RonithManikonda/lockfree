@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <thread>
+
 #include "lockfree/spsc_ring_buffer.hpp"
 
 using lockfree::SpscRingBuffer;
@@ -122,4 +125,78 @@ TEST(SpscRingBuffer, InterleavedSinglePushPop) {
         EXPECT_EQ(v, i);
         EXPECT_TRUE(q.empty_approx());
     }
+}
+
+// ---- Two threads -----------------------------------------------------------
+
+namespace {
+
+// Two fields that must always agree. If the consumer ever saw a slot before
+// the producer's write to it was published, it could observe a mix of old
+// and new contents; TSan would also flag the slot access as a race.
+struct Item {
+    std::uint64_t seq;
+    std::uint64_t check;
+};
+
+template <std::size_t N>
+void run_producer_consumer(std::uint64_t count) {
+    SpscRingBuffer<Item, N> q;
+
+    std::thread producer([&] {
+        for (std::uint64_t i = 0; i < count; ++i) {
+            while (!q.try_push(Item{i, ~i})) std::this_thread::yield();
+        }
+    });
+
+    // Consumer runs on this thread. Record the first mismatch instead of
+    // asserting in the loop, so a failure doesn't leave the producer
+    // spinning on a full queue forever.
+    std::uint64_t expected = 0;
+    bool ok = true;
+    Item got{};
+    Item bad{};
+    while (expected < count) {
+        if (!q.try_pop(got)) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (got.seq != expected || got.check != ~expected) {
+            ok = false;
+            bad = got;
+            break;
+        }
+        ++expected;
+    }
+    if (!ok) {
+        // Drain so the producer can finish and the thread can be joined.
+        for (std::uint64_t left = count - expected - 1; left > 0;) {
+            if (q.try_pop(got)) --left;
+            else std::this_thread::yield();
+        }
+    }
+    producer.join();
+
+    ASSERT_TRUE(ok) << "at index " << expected << ": got seq=" << bad.seq
+                    << " check=" << bad.check;
+    EXPECT_FALSE(q.try_pop(got));
+}
+
+// Modest so the TSan build stays quick; the stress harness scales it later.
+constexpr std::uint64_t kItems = 200'000;
+
+} // namespace
+
+TEST(SpscRingBufferThreads, ExactSequenceTinyQueue) {
+    // N = 2 keeps the queue full or empty almost all the time, so nearly
+    // every operation hits the cross-thread index check.
+    run_producer_consumer<2>(kItems);
+}
+
+TEST(SpscRingBufferThreads, ExactSequenceMediumQueue) {
+    run_producer_consumer<64>(kItems);
+}
+
+TEST(SpscRingBufferThreads, ExactSequenceLargeQueue) {
+    run_producer_consumer<4096>(kItems);
 }
