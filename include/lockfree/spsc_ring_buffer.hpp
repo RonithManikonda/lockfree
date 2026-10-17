@@ -25,6 +25,13 @@ namespace lockfree {
 // counter value is in [read_, write_): push constructs into it before
 // publishing write_, pop destroys it before publishing read_. So T needs no
 // default constructor, and nothing is constructed for empty slots.
+//
+// Each side also keeps a private copy of the other side's counter
+// (read_cache_ for the producer, write_cache_ for the consumer) and only
+// reloads the real atomic when the queue looks full or empty from that copy.
+// The copy can only be stale in the safe direction: the real read_ is never
+// behind read_cache_, so the producer may think the queue is fuller than it
+// is, never emptier (and the mirror image for the consumer).
 template <typename T, std::size_t N>
 class SpscRingBuffer {
     static_assert(N >= 2, "capacity must be at least 2");
@@ -52,10 +59,15 @@ public:
     bool try_emplace(Args&&... args) noexcept(
         std::is_nothrow_constructible_v<T, Args&&...>) {
         const std::size_t w = write_.load(std::memory_order_relaxed);
-        // acquire pairs with the consumer's release store of read_: once we
-        // see the slot as free, the consumer's destruction of the old element
-        // has finished and we can construct over it.
-        if (w - read_.load(std::memory_order_acquire) == N) return false;
+        if (w - read_cache_ == N) {
+            // acquire pairs with the consumer's release store of read_: once
+            // we see the slot as free, the consumer's destruction of the old
+            // element has finished and we can construct over it. Every value
+            // in read_cache_ came from such a load, so trusting the cache on
+            // the fast path is covered by the same happens-before edge.
+            read_cache_ = read_.load(std::memory_order_acquire);
+            if (w - read_cache_ == N) return false;
+        }
         ::new (static_cast<void*>(storage(w))) T(std::forward<Args>(args)...);
         // release publishes the constructed element before the new count.
         write_.store(w + 1, std::memory_order_release);
@@ -74,9 +86,7 @@ public:
     // stays in the queue (the slot isn't released).
     bool try_pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
         const std::size_t r = read_.load(std::memory_order_relaxed);
-        // acquire pairs with the producer's release store of write_, so the
-        // constructed element is visible before we touch it.
-        if (r == write_.load(std::memory_order_acquire)) return false;
+        if (!has_item(r)) return false;
         T* p = slot(r);
         out = std::move(*p);
         p->~T();
@@ -90,7 +100,7 @@ public:
     // assignable, at the cost of an optional.
     std::optional<T> try_pop() noexcept(std::is_nothrow_move_constructible_v<T>) {
         const std::size_t r = read_.load(std::memory_order_relaxed);
-        if (r == write_.load(std::memory_order_acquire)) return std::nullopt;
+        if (!has_item(r)) return std::nullopt;
         T* p = slot(r);
         std::optional<T> out(std::move(*p));
         p->~T();
@@ -121,6 +131,16 @@ private:
         alignas(T) std::byte bytes[sizeof(T)];
     };
 
+    // Consumer only: is there an element at counter value r?
+    bool has_item(std::size_t r) noexcept {
+        if (r != write_cache_) return true;
+        // acquire pairs with the producer's release store of write_, so the
+        // constructed element is visible before we touch it. As on the
+        // producer side, cached values all came from this acquire load.
+        write_cache_ = write_.load(std::memory_order_acquire);
+        return r != write_cache_;
+    }
+
     void* storage(std::size_t index) noexcept { return buffer_[index & mask].bytes; }
 
     // launder: the bytes are reused for a new T each lap, so a plain cast
@@ -129,10 +149,22 @@ private:
         return std::launder(static_cast<T*>(storage(index)));
     }
 
-    // Each index on its own line so the producer and consumer don't
-    // invalidate each other's cache line on every operation.
+    // Each side's line holds its own counter plus its cached copy of the
+    // other side's, so the hot path only touches lines the thread already
+    // owns. Without the caches, every push read read_ and every pop read
+    // write_, so each operation pulled the other core's line over (and the
+    // next store on that core had to invalidate our copy again). With them,
+    // a line only crosses cores when a side actually runs out of room or
+    // items according to its copy, which in a steady stream is about once
+    // per lap instead of once per element.
+    //
+    // Consumer's line: read_ is shared (the producer reloads it when the
+    // queue looks full), write_cache_ is touched by the consumer only.
     alignas(detail::cache_line_size) std::atomic<std::size_t> read_{0};
+    std::size_t write_cache_{0};
+    // Producer's line.
     alignas(detail::cache_line_size) std::atomic<std::size_t> write_{0};
+    std::size_t read_cache_{0};
     alignas(detail::cache_line_size) Slot buffer_[N];
 };
 

@@ -130,6 +130,59 @@ TEST(SpscRingBuffer, InterleavedSinglePushPop) {
     }
 }
 
+// Each side caches the other's counter and only reloads it when the cache says
+// full/empty. These check that a stale cache gets refreshed instead of
+// reporting a full or empty queue that has since changed.
+
+TEST(SpscRingBuffer, ProducerSeesSlotFreedAfterFailedPush) {
+    SpscRingBuffer<int, 4> q;
+    for (int i = 0; i < 4; ++i) ASSERT_TRUE(q.try_push(i));
+    ASSERT_FALSE(q.try_push(-1));  // producer's cache now says full
+    int v = 0;
+    ASSERT_TRUE(q.try_pop(v));
+    EXPECT_EQ(v, 0);
+    EXPECT_TRUE(q.try_push(4)) << "push must reload read_ when the cache says full";
+    EXPECT_FALSE(q.try_push(-1));
+    for (int want = 1; want <= 4; ++want) {
+        ASSERT_TRUE(q.try_pop(v));
+        EXPECT_EQ(v, want);
+    }
+}
+
+TEST(SpscRingBuffer, ConsumerSeesItemsPushedAfterFailedPop) {
+    SpscRingBuffer<int, 8> q;
+    ASSERT_FALSE(q.try_pop().has_value());  // consumer's cache now says empty
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(q.try_push(i));
+    // Only the first pop should need a reload; the next two run off the cache.
+    for (int i = 0; i < 3; ++i) {
+        auto v = q.try_pop();
+        ASSERT_TRUE(v.has_value()) << "pop must reload write_ when the cache says empty";
+        EXPECT_EQ(*v, i);
+    }
+    EXPECT_FALSE(q.try_pop().has_value());
+}
+
+TEST(SpscRingBuffer, CachesTrackAcrossLapsAtFullAndEmpty) {
+    // Alternate between hitting full and hitting empty so both caches go
+    // stale and get refreshed many times, across the wrap point.
+    SpscRingBuffer<int, 4> q;
+    int next_in = 0;
+    int next_out = 0;
+    int v = 0;
+    for (int round = 0; round < 200; ++round) {
+        while (q.try_push(next_in)) ++next_in;
+        ASSERT_EQ(next_in - next_out, 4);
+        const int take = 1 + round % 4;
+        for (int i = 0; i < take; ++i) {
+            ASSERT_TRUE(q.try_pop(v));
+            ASSERT_EQ(v, next_out++);
+        }
+        if (take == 4) {
+            ASSERT_FALSE(q.try_pop(v));
+        }
+    }
+}
+
 // ---- Element types beyond int ----------------------------------------------
 
 TEST(SpscRingBuffer, MoveOnlyElements) {
