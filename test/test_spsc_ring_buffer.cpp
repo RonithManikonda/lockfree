@@ -190,6 +190,117 @@ TEST(SpscRingBuffer, ThrowingConstructorLeavesQueueUnchanged) {
     EXPECT_FALSE(q.try_pop());
 }
 
+// ---- Object lifetimes -------------------------------------------------------
+
+namespace {
+
+// Counts live instances and catches double destruction: each object carries
+// a canary that its destructor clears, so destroying it twice (or destroying
+// a slot that never held an object) trips the check.
+struct Tracked {
+    static inline int live = 0;
+    static inline int bad_destroys = 0;
+    static constexpr unsigned kAlive = 0xA11CE;
+
+    explicit Tracked(int v) : value(v) { ++live; }
+    Tracked(const Tracked& o) : value(o.value) { ++live; }
+    Tracked(Tracked&& o) noexcept : value(o.value) { ++live; }
+    Tracked& operator=(const Tracked&) = default;
+    Tracked& operator=(Tracked&&) noexcept = default;
+    ~Tracked() {
+        if (canary != kAlive) ++bad_destroys;
+        canary = 0;
+        --live;
+    }
+
+    int value;
+    unsigned canary = kAlive;
+};
+
+class SpscLifetime : public ::testing::Test {
+protected:
+    void SetUp() override {
+        Tracked::live = 0;
+        Tracked::bad_destroys = 0;
+    }
+    void TearDown() override {
+        EXPECT_EQ(Tracked::live, 0) << "leaked or over-destroyed elements";
+        EXPECT_EQ(Tracked::bad_destroys, 0);
+    }
+};
+
+} // namespace
+
+TEST_F(SpscLifetime, EmptyQueueConstructsNothing) {
+    SpscRingBuffer<Tracked, 64> q;
+    EXPECT_EQ(Tracked::live, 0);
+}
+
+TEST_F(SpscLifetime, OneLiveObjectPerQueuedElement) {
+    SpscRingBuffer<Tracked, 8> q;
+    for (int i = 0; i < 5; ++i) ASSERT_TRUE(q.try_emplace(i));
+    EXPECT_EQ(Tracked::live, 5);
+
+    Tracked out(-1); // +1 live, held by the test
+    ASSERT_TRUE(q.try_pop(out));
+    EXPECT_EQ(out.value, 0);
+    EXPECT_EQ(Tracked::live, 5); // 4 queued + out
+
+    {
+        auto opt = q.try_pop();
+        ASSERT_TRUE(opt);
+        EXPECT_EQ(opt->value, 1);
+        EXPECT_EQ(Tracked::live, 5); // 3 queued + out + opt
+    }
+    EXPECT_EQ(Tracked::live, 4);
+}
+
+TEST_F(SpscLifetime, PushCopiesAndMovesWithoutLeaking) {
+    SpscRingBuffer<Tracked, 4> q;
+    Tracked a(1);
+    ASSERT_TRUE(q.try_push(a));            // copy
+    ASSERT_TRUE(q.try_push(Tracked(2)));   // move from a temporary
+    EXPECT_EQ(Tracked::live, 3);
+    EXPECT_EQ(a.value, 1);
+    EXPECT_EQ(q.try_pop()->value, 1);
+    EXPECT_EQ(q.try_pop()->value, 2);
+    EXPECT_EQ(Tracked::live, 1);
+}
+
+TEST_F(SpscLifetime, DestructorDrainsRemainingElements) {
+    {
+        SpscRingBuffer<Tracked, 8> q;
+        for (int i = 0; i < 8; ++i) ASSERT_TRUE(q.try_emplace(i));
+        for (int i = 0; i < 3; ++i) ASSERT_TRUE(q.try_pop());
+        EXPECT_EQ(Tracked::live, 5);
+    }
+    // TearDown checks live == 0 and no double destroys.
+}
+
+TEST_F(SpscLifetime, DestructorDrainsAcrossTheWrapPoint) {
+    // Leave elements straddling the end of the buffer so the drain loop has
+    // to follow the masked index back around to slot 0.
+    {
+        SpscRingBuffer<Tracked, 4> q;
+        for (int i = 0; i < 3; ++i) ASSERT_TRUE(q.try_emplace(i));
+        for (int i = 0; i < 3; ++i) ASSERT_TRUE(q.try_pop());
+        for (int i = 0; i < 4; ++i) ASSERT_TRUE(q.try_emplace(10 + i)); // slots 3,0,1,2
+        EXPECT_EQ(Tracked::live, 4);
+    }
+}
+
+TEST_F(SpscLifetime, ManyLapsKeepCountsBalanced) {
+    SpscRingBuffer<Tracked, 4> q;
+    for (int i = 0; i < 1000; ++i) {
+        ASSERT_TRUE(q.try_emplace(i));
+        if (i % 3 != 0) ASSERT_TRUE(q.try_pop());
+        ASSERT_LE(Tracked::live, 4);
+        if (q.size_approx() == 4) {
+            while (q.try_pop()) {}
+        }
+    }
+}
+
 // ---- Two threads -----------------------------------------------------------
 
 namespace {
@@ -262,4 +373,33 @@ TEST(SpscRingBufferThreads, ExactSequenceMediumQueue) {
 
 TEST(SpscRingBufferThreads, ExactSequenceLargeQueue) {
     run_producer_consumer<4096>(kItems);
+}
+
+
+TEST(SpscRingBufferThreads, MoveOnlyAcrossThreads) {
+    constexpr int kCount = 50'000;
+    SpscRingBuffer<std::unique_ptr<int>, 16> q;
+
+    std::thread producer([&] {
+        for (int i = 0; i < kCount; ++i) {
+            auto p = std::make_unique<int>(i);
+            // try_push(T&&) only moves from p on success, so retrying is safe.
+            while (!q.try_push(std::move(p))) std::this_thread::yield();
+        }
+    });
+
+    int expected = 0;
+    bool ok = true;
+    while (expected < kCount) {
+        auto got = q.try_pop();
+        if (!got) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (!*got || **got != expected) ok = false;
+        ++expected;
+    }
+    producer.join();
+    EXPECT_TRUE(ok);
+    EXPECT_FALSE(q.try_pop());
 }
