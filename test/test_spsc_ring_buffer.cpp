@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "lockfree/spsc_ring_buffer.hpp"
+#include "stress_harness.hpp"
 
 using lockfree::SpscRingBuffer;
 
@@ -356,7 +357,14 @@ TEST_F(SpscLifetime, ManyLapsKeepCountsBalanced) {
 
 // ---- Two threads -----------------------------------------------------------
 
+using lockfree::test::maybe_delay;
+using lockfree::test::run_stress;
+using lockfree::test::scaled;
+using lockfree::test::StressRng;
+
 namespace {
+
+class SpscRingBufferThreads : public lockfree::test::StressTest {};
 
 // Two fields that must always agree. If the consumer ever saw a slot before
 // the producer's write to it was published, it could observe a mix of old
@@ -366,70 +374,70 @@ struct Item {
     std::uint64_t check;
 };
 
+// Thread 0 produces, thread 1 consumes. Both sides insert random delays so
+// the queue spends time full, empty and in between. The consumer never stops
+// early: it pops all `count` items and remembers the first mismatch, so the
+// producer can always finish and the threads can be joined.
 template <std::size_t N>
 void run_producer_consumer(std::uint64_t count) {
     SpscRingBuffer<Item, N> q;
 
-    std::thread producer([&] {
-        for (std::uint64_t i = 0; i < count; ++i) {
-            while (!q.try_push(Item{i, ~i})) std::this_thread::yield();
+    std::uint64_t popped = 0;
+    std::uint64_t first_bad_index = 0;
+    Item bad{};
+    bool ok = true;
+
+    run_stress(2, [&](std::size_t index, StressRng& rng) {
+        if (index == 0) {
+            for (std::uint64_t i = 0; i < count; ++i) {
+                maybe_delay(rng);
+                while (!q.try_push(Item{i, ~i})) std::this_thread::yield();
+            }
+            return;
+        }
+        Item got{};
+        while (popped < count) {
+            maybe_delay(rng);
+            if (!q.try_pop(got)) {
+                std::this_thread::yield();
+                continue;
+            }
+            if (ok && (got.seq != popped || got.check != ~popped)) {
+                ok = false;
+                first_bad_index = popped;
+                bad = got;
+            }
+            ++popped;
         }
     });
 
-    // Consumer runs on this thread. Record the first mismatch instead of
-    // asserting in the loop, so a failure doesn't leave the producer
-    // spinning on a full queue forever.
-    std::uint64_t expected = 0;
-    bool ok = true;
-    Item got{};
-    Item bad{};
-    while (expected < count) {
-        if (!q.try_pop(got)) {
-            std::this_thread::yield();
-            continue;
-        }
-        if (got.seq != expected || got.check != ~expected) {
-            ok = false;
-            bad = got;
-            break;
-        }
-        ++expected;
-    }
-    if (!ok) {
-        // Drain so the producer can finish and the thread can be joined.
-        for (std::uint64_t left = count - expected - 1; left > 0;) {
-            if (q.try_pop(got)) --left;
-            else std::this_thread::yield();
-        }
-    }
-    producer.join();
-
-    ASSERT_TRUE(ok) << "at index " << expected << ": got seq=" << bad.seq
+    ASSERT_TRUE(ok) << "at index " << first_bad_index << ": got seq=" << bad.seq
                     << " check=" << bad.check;
-    EXPECT_FALSE(q.try_pop(got));
+    Item extra{};
+    EXPECT_FALSE(q.try_pop(extra));
 }
 
-// Modest so the TSan build stays quick; the stress harness scales it later.
-constexpr std::uint64_t kItems = 200'000;
+// Modest so the TSan build stays quick; LOCKFREE_STRESS_SCALE raises it.
+const std::uint64_t kItems = scaled(200'000);
 
 } // namespace
 
-TEST(SpscRingBufferThreads, ExactSequenceTinyQueue) {
+TEST_F(SpscRingBufferThreads, ExactSequenceTinyQueue) {
     // N = 2 keeps the queue full or empty almost all the time, so nearly
     // every operation hits the cross-thread index check.
     run_producer_consumer<2>(kItems);
 }
 
-TEST(SpscRingBufferThreads, ExactSequenceMediumQueue) {
+TEST_F(SpscRingBufferThreads, ExactSequenceMediumQueue) {
     run_producer_consumer<64>(kItems);
 }
 
-TEST(SpscRingBufferThreads, ExactSequenceLargeQueue) {
+TEST_F(SpscRingBufferThreads, ExactSequenceLargeQueue) {
     run_producer_consumer<4096>(kItems);
 }
 
 
-TEST(SpscRingBufferThreads, MoveOnlyAcrossThreads) {
+TEST_F(SpscRingBufferThreads, MoveOnlyAcrossThreads) {
     constexpr int kCount = 50'000;
     SpscRingBuffer<std::unique_ptr<int>, 16> q;
 
