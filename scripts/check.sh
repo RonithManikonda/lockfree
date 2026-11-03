@@ -4,6 +4,10 @@
 #   scripts/check.sh                # all configs
 #   scripts/check.sh tsan asan      # just these
 #
+# Two extra configs aren't in the default set: `release` (optimized, benches
+# built) and `asan-ubsan` (both in one build). CI uses those to keep its job
+# count down.
+#
 # Each config gets its own build-<name>/ directory (plain Debug uses build/) so
 # reruns are incremental. Exits non-zero if any config fails to build or test;
 # the remaining configs still run so one failure doesn't hide another.
@@ -37,6 +41,8 @@ configure_args() {
         tsan)  echo "-DCMAKE_BUILD_TYPE=Debug -DLOCKFREE_SANITIZER=thread -DLOCKFREE_BUILD_BENCH=OFF" ;;
         asan)  echo "-DCMAKE_BUILD_TYPE=Debug -DLOCKFREE_SANITIZER=address -DLOCKFREE_BUILD_BENCH=OFF" ;;
         ubsan) echo "-DCMAKE_BUILD_TYPE=Debug -DLOCKFREE_SANITIZER=undefined -DLOCKFREE_BUILD_BENCH=OFF" ;;
+        asan-ubsan) echo "-DCMAKE_BUILD_TYPE=Debug -DLOCKFREE_SANITIZER=address,undefined -DLOCKFREE_BUILD_BENCH=OFF" ;;
+        release) echo "-DCMAKE_BUILD_TYPE=Release" ;;
         *) return 1 ;;
     esac
 }
@@ -50,7 +56,7 @@ failed=()
 
 for cfg in "${configs[@]}"; do
     if ! args="$(configure_args "$cfg")"; then
-        echo "check.sh: unknown config '$cfg' (expected: ${all_configs[*]})" >&2
+        echo "check.sh: unknown config '$cfg' (expected: ${all_configs[*]} release asan-ubsan)" >&2
         exit 2
     fi
     dir="$(build_dir "$cfg")"

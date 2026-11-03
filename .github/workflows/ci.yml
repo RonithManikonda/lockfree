@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.os }} ${{ matrix.compiler }} ${{ matrix.config }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        compiler: [gcc, clang]
+        config: [release, tsan, asan-ubsan]
+        include:
+          # macos-latest is arm64: weakly ordered, so it's where a missing
+          # acquire/release actually shows up.
+          - { os: macos-latest, compiler: apple-clang, config: release }
+          - { os: macos-latest, compiler: apple-clang, config: tsan }
+          - { os: macos-latest, compiler: apple-clang, config: asan-ubsan }
+    env:
+      # Keep the stress tests short; soak runs happen locally.
+      LOCKFREE_STRESS_SCALE: "0.25"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select compiler
+        run: |
+          case "${{ matrix.compiler }}" in
+            gcc)   echo "CC=gcc"   >> "$GITHUB_ENV"; echo "CXX=g++"     >> "$GITHUB_ENV" ;;
+            clang) echo "CC=clang" >> "$GITHUB_ENV"; echo "CXX=clang++" >> "$GITHUB_ENV" ;;
+          esac
+
+      # Recent Ubuntu kernels randomize mmap with more bits than TSan's shadow
+      # memory layout allows, and every TSan binary dies at startup with
+      # "unexpected memory mapping".
+      - name: Lower ASLR entropy for TSan
+        if: runner.os == 'Linux' && matrix.config == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Build and test
+        run: scripts/check.sh ${{ matrix.config }}

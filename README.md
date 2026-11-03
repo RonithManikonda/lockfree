@@ -1,5 +1,7 @@
 # lockfree
 
+[![ci](https://github.com/RonithManikonda/lockfree/actions/workflows/ci.yml/badge.svg)](https://github.com/RonithManikonda/lockfree/actions/workflows/ci.yml)
+
 A from-scratch C++20 **concurrent queue library** built to develop deep understanding
 of lock-free programming — paired with a **verification harness** (sanitizers,
 stress tests, linearizability checking, a deterministic scheduler) and a
