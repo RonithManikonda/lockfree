@@ -6,11 +6,13 @@
 #include <benchmark/benchmark.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <thread>
 
 #include "baseline_queues.hpp"
+#include "latency.hpp"
 #include "lockfree/spsc_ring_buffer.hpp"
 
 namespace {
@@ -75,9 +77,77 @@ void BM_MutexQueue(benchmark::State& state) {
     run_throughput(state, q);
 }
 
+// Ping-pong latency: the benchmark thread pushes a token into `ping`, an
+// echo thread pops it and pushes it back on `pong`, and we time each full
+// round trip. Only one token is ever in flight, so this measures how long a
+// handoff takes when the other side is waiting for it, not how many items
+// fit through when both sides stay busy (that's the throughput bench).
+//
+// Each sample is one round trip, i.e. two handoffs. steady_clock on Apple
+// Silicon ticks at 24 MHz (~42 ns), so the low percentiles are quantized to
+// that; the shape of the tail is still what matters.
+template <typename Ping, typename Pong>
+void run_ping_pong(benchmark::State& state, Ping& ping, Pong& pong) {
+    std::atomic<bool> ready{false};
+    std::atomic<bool> done{false};
+
+    std::thread echo([&] {
+        std::uint64_t token = 0;
+        ready.store(true, std::memory_order_release);
+        while (!done.load(std::memory_order_acquire)) {
+            if (ping.try_pop(token)) {
+                while (!pong.try_push(token)) {
+                }
+            }
+        }
+    });
+    while (!ready.load(std::memory_order_acquire)) std::this_thread::yield();
+
+    lockfree::bench::LatencyHistogram histogram;
+    std::uint64_t token = 0;
+    std::uint64_t reply = 0;
+    bool mismatch = false;
+    for (auto _ : state) {
+        const auto start = std::chrono::steady_clock::now();
+        while (!ping.try_push(token)) {
+        }
+        while (!pong.try_pop(reply)) {
+        }
+        const auto stop = std::chrono::steady_clock::now();
+        histogram.record(static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count()));
+        if (reply != token) mismatch = true;
+        ++token;
+    }
+    // The last token has already come back, so the echo thread is idle and
+    // will see done on its next spin.
+    done.store(true, std::memory_order_release);
+    echo.join();
+
+    if (mismatch) state.SkipWithError("echo returned the wrong token");
+    state.counters["p50_ns"] = static_cast<double>(histogram.percentile(0.50));
+    state.counters["p99_ns"] = static_cast<double>(histogram.percentile(0.99));
+    state.counters["p999_ns"] = static_cast<double>(histogram.percentile(0.999));
+    state.counters["max_ns"] = static_cast<double>(histogram.max());
+}
+
+void BM_SpscRoundTrip(benchmark::State& state) {
+    lockfree::SpscRingBuffer<std::uint64_t, 64> ping;
+    lockfree::SpscRingBuffer<std::uint64_t, 64> pong;
+    run_ping_pong(state, ping, pong);
+}
+
+void BM_MutexRoundTrip(benchmark::State& state) {
+    lockfree::bench::MutexQueue<std::uint64_t> ping(64);
+    lockfree::bench::MutexQueue<std::uint64_t> pong(64);
+    run_ping_pong(state, ping, pong);
+}
+
 } // namespace
 
 BENCHMARK_TEMPLATE(BM_SpscRingBuffer, 64)->UseRealTime();
 BENCHMARK_TEMPLATE(BM_SpscRingBuffer, 1024)->UseRealTime();
 BENCHMARK_TEMPLATE(BM_SpscRingBuffer, 65536)->UseRealTime();
 BENCHMARK(BM_MutexQueue)->Arg(64)->Arg(1024)->Arg(65536)->UseRealTime();
+BENCHMARK(BM_SpscRoundTrip)->UseRealTime();
+BENCHMARK(BM_MutexRoundTrip)->UseRealTime();

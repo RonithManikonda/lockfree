@@ -19,6 +19,7 @@ set(LOCKFREE_TESTS
   test_seqlock
   test_locks
   interleaving_test
+  test_latency_histogram
 )
 
 foreach(test ${LOCKFREE_TESTS})
@@ -27,3 +28,6 @@ foreach(test ${LOCKFREE_TESTS})
   target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME ${test} COMMAND ${test})
 endforeach()
+
+# The latency histogram lives with the benches but is plain logic worth testing.
+target_include_directories(test_latency_histogram PRIVATE ${PROJECT_SOURCE_DIR}/bench)
