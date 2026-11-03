@@ -79,6 +79,12 @@ cmake -S . -B build-tsan -DLOCKFREE_SANITIZER=thread && cmake --build build-tsan
 cmake -S . -B build-asan -DLOCKFREE_SANITIZER=address && cmake --build build-asan
 ```
 
+Or run everything (Debug, TSan, ASan, UBSan) and get one pass/fail:
+
+```bash
+scripts/check.sh            # or e.g. scripts/check.sh tsan
+```
+
 ## Requirements
 
 - C++20 compiler (Clang or GCC)

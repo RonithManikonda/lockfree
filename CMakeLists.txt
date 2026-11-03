@@ -28,6 +28,10 @@ target_link_libraries(lockfree INTERFACE Threads::Threads)
 if(NOT LOCKFREE_SANITIZER STREQUAL "none")
   add_compile_options(-fsanitize=${LOCKFREE_SANITIZER} -g -O1 -fno-omit-frame-pointer)
   add_link_options(-fsanitize=${LOCKFREE_SANITIZER})
+  # UBSan's default is to print and keep going, so a test with UB still passes.
+  if(LOCKFREE_SANITIZER STREQUAL "undefined")
+    add_compile_options(-fno-sanitize-recover=undefined)
+  endif()
 endif()
 
 if(LOCKFREE_BUILD_TESTS)
