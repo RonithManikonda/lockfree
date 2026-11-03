@@ -1,5 +1,7 @@
 // SPSC throughput: the benchmark thread is the producer, a second thread is
-// the consumer. Each iteration moves one item through the queue, so
+// the consumer. Producer and consumer are pinned to CPUs 0 and 1 where the OS
+// allows it (see affinity.hpp); the `pinned` counter says whether it did.
+// Each iteration moves one item through the queue, so
 // items_per_second is end-to-end transfer rate. Real time, not CPU time:
 // the producer's CPU time says nothing about how long the consumer took.
 
@@ -11,6 +13,7 @@
 #include <memory>
 #include <thread>
 
+#include "affinity.hpp"
 #include "baseline_queues.hpp"
 #include "latency.hpp"
 #include "lockfree/spsc_ring_buffer.hpp"
@@ -23,8 +26,10 @@ void run_throughput(benchmark::State& state, Queue& q) {
     std::atomic<bool> done{false};
     std::atomic<std::uint64_t> received{0};
     bool out_of_order = false;
+    bool consumer_pinned = false;
 
     std::thread consumer([&] {
+        consumer_pinned = lockfree::bench::pin_current_thread(1);
         std::uint64_t expected = 0;
         std::uint64_t value = 0;
         ready.store(true, std::memory_order_release);
@@ -45,6 +50,7 @@ void run_throughput(benchmark::State& state, Queue& q) {
         received.store(expected, std::memory_order_relaxed);
     });
 
+    const bool producer_pinned = lockfree::bench::pin_current_thread(0);
     // Don't time thread startup.
     while (!ready.load(std::memory_order_acquire)) std::this_thread::yield();
 
@@ -63,6 +69,7 @@ void run_throughput(benchmark::State& state, Queue& q) {
         state.SkipWithError("consumer lost items");
     }
     state.SetItemsProcessed(static_cast<std::int64_t>(next));
+    state.counters["pinned"] = producer_pinned && consumer_pinned ? 1 : 0;
 }
 
 template <std::size_t N>
@@ -91,7 +98,10 @@ void run_ping_pong(benchmark::State& state, Ping& ping, Pong& pong) {
     std::atomic<bool> ready{false};
     std::atomic<bool> done{false};
 
+    bool echo_pinned = false;
+
     std::thread echo([&] {
+        echo_pinned = lockfree::bench::pin_current_thread(1);
         std::uint64_t token = 0;
         ready.store(true, std::memory_order_release);
         while (!done.load(std::memory_order_acquire)) {
@@ -101,6 +111,7 @@ void run_ping_pong(benchmark::State& state, Ping& ping, Pong& pong) {
             }
         }
     });
+    const bool sender_pinned = lockfree::bench::pin_current_thread(0);
     while (!ready.load(std::memory_order_acquire)) std::this_thread::yield();
 
     lockfree::bench::LatencyHistogram histogram;
@@ -129,6 +140,7 @@ void run_ping_pong(benchmark::State& state, Ping& ping, Pong& pong) {
     state.counters["p99_ns"] = static_cast<double>(histogram.percentile(0.99));
     state.counters["p999_ns"] = static_cast<double>(histogram.percentile(0.999));
     state.counters["max_ns"] = static_cast<double>(histogram.max());
+    state.counters["pinned"] = sender_pinned && echo_pinned ? 1 : 0;
 }
 
 void BM_SpscRoundTrip(benchmark::State& state) {
