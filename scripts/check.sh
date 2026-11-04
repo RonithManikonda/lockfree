@@ -12,8 +12,9 @@
 # reruns are incremental. Exits non-zero if any config fails to build or test;
 # the remaining configs still run so one failure doesn't hide another.
 #
-# Env: JOBS (parallelism, default: CPU count), LOCKFREE_STRESS_SCALE and
-# LOCKFREE_SEED are passed through to the tests.
+# Env: JOBS (parallelism, default: CPU count), TEST_TIMEOUT (seconds per test,
+# default 300), LOCKFREE_STRESS_SCALE and LOCKFREE_SEED are passed through to
+# the tests.
 set -u
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,6 +23,10 @@ cd "$root"
 if [[ -z "${JOBS:-}" ]]; then
     JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 fi
+
+# A stress test that livelocks should fail with its name on it, not hang the
+# whole run until something outside kills it.
+TEST_TIMEOUT="${TEST_TIMEOUT:-300}"
 
 # Sanitizers should stop at the first report with a stack trace; a report that
 # scrolls past while the test still exits 0 is as good as no report.
@@ -65,7 +70,7 @@ for cfg in "${configs[@]}"; do
     # shellcheck disable=SC2086  # args is a deliberate word list
     if cmake -S . -B "$dir" $args >/dev/null \
         && cmake --build "$dir" -j "$JOBS" \
-        && ctest --test-dir "$dir" --output-on-failure -j "$JOBS"; then
+        && ctest --test-dir "$dir" --output-on-failure -j "$JOBS" --timeout "$TEST_TIMEOUT"; then
         passed+=("$cfg")
     else
         echo "==> [$cfg] FAILED" >&2

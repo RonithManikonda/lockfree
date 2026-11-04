@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <limits>
 
@@ -26,9 +27,13 @@ TEST(LatencyHistogram, SmallValuesAreExact) {
 TEST(LatencyHistogram, BucketsAreContiguousAndMonotonic) {
     // Every value maps to a bucket whose upper bound is >= the value, and the
     // previous bucket's bound is below it: no gaps, no overlaps.
-    for (std::uint64_t v : {0ull, 1ull, 63ull, 64ull, 65ull, 127ull, 128ull, 1000ull,
-                            123456789ull, 1ull << 40, (1ull << 63) + 5,
-                            std::numeric_limits<std::uint64_t>::max()}) {
+    // Typed array rather than a braced list: on Linux uint64_t is unsigned long,
+    // so mixing ull literals with numeric_limits<uint64_t> won't deduce.
+    const std::array<std::uint64_t, 12> values{0, 1, 63, 64, 65, 127, 128, 1000,
+                                               123456789, std::uint64_t{1} << 40,
+                                               (std::uint64_t{1} << 63) + 5,
+                                               std::numeric_limits<std::uint64_t>::max()};
+    for (const std::uint64_t v : values) {
         const auto b = LatencyHistogram::bucket_of(v);
         ASSERT_LT(b, LatencyHistogram::bucket_count) << v;
         EXPECT_GE(LatencyHistogram::upper_bound_of(b), v) << v;
