@@ -9,8 +9,53 @@ stress tests, linearizability checking, a deterministic scheduler) and a
 
 ## Status
 
-Bare-bones skeleton. Build files are wired; all headers, sources, tests, and
-benchmarks are empty stubs — nothing is implemented yet.
+| Piece | State |
+|-------|-------|
+| `SpscRingBuffer<T, N>` | done: unit + two-thread stress tests, [design notes](docs/spsc_ring_buffer.md) |
+| Stress harness (`test/stress_harness.hpp`) | done: start barrier, seeded per-thread RNG, `LOCKFREE_SEED` / `LOCKFREE_STRESS_SCALE` |
+| Benchmarks (`bench/bench_spsc.cpp`) | SPSC throughput vs a mutex queue, ping-pong latency p50/p99/p99.9 |
+| Verification | `scripts/check.sh` (Debug, TSan, ASan, UBSan); CI on Linux gcc/clang and macOS arm64 |
+| MPMC, MPSC, atomic stack, reclamation, primitives | not started (headers are stubs) |
+| Linearizability checker, adversarial scheduler | not started |
+
+## Usage
+
+Header-only: add `include/` to your include path (or link the `lockfree` CMake
+target) and include what you need.
+
+```cpp
+#include <lockfree/spsc_ring_buffer.hpp>
+
+#include <cstdio>
+#include <string>
+#include <thread>
+
+int main() {
+    // Capacity must be a power of two; all N slots are usable.
+    lockfree::SpscRingBuffer<std::string, 1024> q;
+
+    // Exactly one thread pushes and exactly one pops.
+    std::thread producer([&] {
+        for (int i = 0; i < 100; ++i) {
+            while (!q.try_push("msg " + std::to_string(i))) std::this_thread::yield();
+        }
+    });
+
+    for (int received = 0; received < 100;) {
+        if (auto s = q.try_pop()) {  // std::optional<std::string>
+            std::puts(s->c_str());
+            ++received;
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    producer.join();
+}
+```
+
+`try_push` / `try_pop` never block: they return `false` (or an empty
+`optional`) when the queue is full or empty, and the caller decides whether to
+spin, yield, or do something else. `try_emplace(args...)` constructs in place.
 
 ## Structures, by tier
 
