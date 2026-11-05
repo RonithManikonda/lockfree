@@ -20,6 +20,7 @@ set(LOCKFREE_TESTS
   test_locks
   interleaving_test
   test_latency_histogram
+  test_atomic_backoff
 )
 
 foreach(test ${LOCKFREE_TESTS})
