@@ -6,6 +6,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "lockfree/atomic_backoff.hpp"
 #include "lockfree/detail/cache_line.hpp"
 
 namespace lockfree {
@@ -105,6 +106,50 @@ public:
         return out;
     }
 
+    // Blocking wrappers: spin with Backoff until the try_ version succeeds.
+    // They never give up, so a push into a queue nobody pops from (or a pop
+    // from one nobody pushes to) waits forever. Once Backoff reaches its
+    // yield phase they don't burn a core, but they don't sleep either; this
+    // is for threads that expect the wait to be short.
+
+    template <typename... Args>
+    void emplace(Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+        Backoff backoff;
+        if constexpr (std::is_nothrow_constructible_v<T, Args&&...>) {
+            // Forwarding the same args on every attempt is fine: they're only
+            // consumed by the attempt that claims a cell, and that one returns.
+            while (!emplace_claimed(std::forward<Args>(args)...)) backoff.pause();
+        } else {
+            // Build once, not once per retry.
+            T tmp(std::forward<Args>(args)...);
+            while (!emplace_claimed(std::move(tmp))) backoff.pause();
+        }
+    }
+
+    void push(const T& item) noexcept(std::is_nothrow_copy_constructible_v<T>) { emplace(item); }
+
+    void push(T&& item) noexcept { emplace(std::move(item)); }
+
+    T pop() noexcept {
+        Backoff backoff;
+        for (;;) {
+            std::size_t pos;
+            if (Cell* c = claim_for_pop(pos)) {
+                T out(std::move(*c->get()));
+                release_after_pop(c, pos);
+                return out;
+            }
+            backoff.pause();
+        }
+    }
+
+    void pop(T& out) noexcept
+        requires std::is_nothrow_move_assignable_v<T>
+    {
+        Backoff backoff;
+        while (!try_pop(out)) backoff.pause();
+    }
+
     static constexpr std::size_t capacity() noexcept { return N; }
 
     // A snapshot that may be stale by the time it returns. Counts claimed
@@ -141,6 +186,9 @@ private:
     bool emplace_claimed(Args&&... args) noexcept {
         std::size_t pos = enqueue_pos_.load(std::memory_order_relaxed);
         Cell* c;
+        // Only for retries inside this call (lost CAS, stale pos). Waiting
+        // on a full queue is the caller's business: try_ returns, push spins.
+        Backoff backoff;
         for (;;) {
             c = &cells_[pos & mask];
             // acquire pairs with the consumer's release in release_after_pop:
@@ -154,12 +202,17 @@ private:
                                                        std::memory_order_relaxed)) {
                     break;
                 }
+                // Lost to another producer. Everyone who lost read the same
+                // pos and would retry on the same line in lock step; backing
+                // off spreads them out so the next CAS has fewer rivals.
+                backoff.pause();
             } else if (d < 0) {
                 // The cell is still a lap behind: its last element hasn't
                 // been consumed. The queue is full (as of this load).
                 return false;
             } else {
                 // Another producer already took pos; catch up.
+                backoff.pause();
                 pos = enqueue_pos_.load(std::memory_order_relaxed);
             }
         }
@@ -174,6 +227,7 @@ private:
     // nullptr if the queue looked empty.
     Cell* claim_for_pop(std::size_t& pos) noexcept {
         pos = dequeue_pos_.load(std::memory_order_relaxed);
+        Backoff backoff;
         for (;;) {
             Cell* c = &cells_[pos & mask];
             // acquire pairs with the producer's release: the element is fully
@@ -185,10 +239,12 @@ private:
                                                        std::memory_order_relaxed)) {
                     return c;
                 }
+                backoff.pause();
             } else if (d < 0) {
                 // Nothing pushed at pos yet (or the push hasn't finished).
                 return nullptr;
             } else {
+                backoff.pause();
                 pos = dequeue_pos_.load(std::memory_order_relaxed);
             }
         }

@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -178,6 +180,77 @@ TEST(MpmcQueue, NonTrivialElementsSurviveLaps) {
     ASSERT_TRUE(q.try_push(std::string(64, 'z')));
 }
 
+// ---- Blocking push / pop -----------------------------------------------------
+
+TEST(MpmcQueue, BlockingCallsReturnRightAwayWhenTheyCan) {
+    MpmcQueue<int, 4> q;
+    q.push(1);
+    const int two = 2;
+    q.push(two);
+    q.emplace(3);
+    EXPECT_EQ(q.size_approx(), 3u);
+    EXPECT_EQ(q.pop(), 1);
+    int v = 0;
+    q.pop(v);
+    EXPECT_EQ(v, 2);
+    EXPECT_EQ(q.pop(), 3);
+    EXPECT_TRUE(q.empty_approx());
+}
+
+TEST(MpmcQueue, BlockingPushWaitsForRoom) {
+    MpmcQueue<int, 2> q;
+    q.push(1);
+    q.push(2);
+    std::atomic<bool> pushed{false};
+    std::thread producer([&] {
+        q.push(3);  // full: has to wait for the pop below
+        pushed.store(true, std::memory_order_release);
+    });
+    // Not a proof it's blocked, but a push that ignored "full" would almost
+    // always have finished by now.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_FALSE(pushed.load(std::memory_order_acquire));
+    EXPECT_EQ(q.pop(), 1);
+    producer.join();
+    EXPECT_TRUE(pushed.load());
+    EXPECT_EQ(q.pop(), 2);
+    EXPECT_EQ(q.pop(), 3);
+}
+
+TEST(MpmcQueue, BlockingPopWaitsForAnElement) {
+    MpmcQueue<std::string, 4> q;
+    std::string got;
+    std::thread consumer([&] { got = q.pop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    q.push(std::string("late"));
+    consumer.join();
+    EXPECT_EQ(got, "late");
+    EXPECT_TRUE(q.empty_approx());
+}
+
+// The blocking push builds a throwing-constructible element once, then
+// retries with the built copy; a failed attempt must not consume it.
+TEST(MpmcQueue, BlockingPushOfCopyableTypeKeepsTheValueAcrossRetries) {
+    struct Noisy {
+        std::string s;
+        explicit Noisy(std::string v) : s(std::move(v)) {}
+        Noisy(const Noisy& o) : s(o.s) {}  // may throw (allocates)
+        Noisy(Noisy&&) noexcept = default;
+        Noisy& operator=(Noisy&&) noexcept = default;
+    };
+    static_assert(!std::is_nothrow_copy_constructible_v<Noisy>);
+    MpmcQueue<Noisy, 2> q;
+    q.push(Noisy("a"));
+    q.push(Noisy("b"));
+    const Noisy c("c-with-a-long-enough-string-to-allocate");
+    std::thread producer([&] { q.push(c); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    EXPECT_EQ(q.pop().s, "a");
+    producer.join();
+    EXPECT_EQ(q.pop().s, "b");
+    EXPECT_EQ(q.pop().s, c.s);
+}
+
 class MpmcStress : public lockfree::test::StressTest {};
 
 // Every thread both pushes and pops. A sum and count check catches lost or
@@ -317,6 +390,40 @@ TEST_P(MpmcProducersConsumers, ExactlyOnceAndPerProducerOrder) {
     }
     EXPECT_EQ(missing, 0u);
     EXPECT_EQ(duplicated, 0u);
+}
+
+// Same shape as above, but everyone uses the blocking calls, so the waiting
+// goes through Backoff instead of yield loops in the test. Consumers are
+// told up front how many to take, since pop() never gives up.
+TEST_P(MpmcProducersConsumers, BlockingCallsExactlyOnce) {
+    const auto [producers, consumers] = GetParam();
+    const std::uint64_t per_producer = lockfree::test::scaled(10000);
+    const std::uint64_t total = producers * per_producer;
+    MpmcQueue<std::uint64_t, 16> q;
+    std::vector<std::atomic<std::uint8_t>> seen(total);
+
+    lockfree::test::run_stress(producers + consumers, [&](std::size_t index,
+                                                          lockfree::test::StressRng& rng) {
+        if (index < producers) {
+            for (std::uint64_t s = 0; s < per_producer; ++s) {
+                q.push(index * per_producer + s);
+                lockfree::test::maybe_delay(rng);
+            }
+            return;
+        }
+        // Split total across consumers; the first ones take the remainder.
+        const std::size_t c = index - producers;
+        const std::uint64_t share = total / consumers + (c < total % consumers ? 1 : 0);
+        for (std::uint64_t i = 0; i < share; ++i) {
+            const std::uint64_t v = q.pop();
+            if (v < total) seen[v].fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    EXPECT_TRUE(q.empty_approx());
+    std::uint64_t wrong = 0;
+    for (const auto& n : seen) wrong += n.load(std::memory_order_relaxed) != 1;
+    EXPECT_EQ(wrong, 0u) << "values missing or popped more than once";
 }
 
 INSTANTIATE_TEST_SUITE_P(Shapes, MpmcProducersConsumers, ::testing::ValuesIn(all_shapes()),
