@@ -5,6 +5,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "lockfree/mpmc_queue.hpp"
 #include "stress_harness.hpp"
@@ -180,7 +181,7 @@ TEST(MpmcQueue, NonTrivialElementsSurviveLaps) {
 class MpmcStress : public lockfree::test::StressTest {};
 
 // Every thread both pushes and pops. A sum and count check catches lost or
-// duplicated elements; ordering checks come with the dedicated stress step.
+// duplicated elements; the producer/consumer split below checks ordering.
 TEST_F(MpmcStress, MixedPushPopKeepsSumAndCount) {
     constexpr std::size_t threads = 4;
     const std::uint64_t per_thread = lockfree::test::scaled(50000);
@@ -211,3 +212,112 @@ TEST_F(MpmcStress, MixedPushPopKeepsSumAndCount) {
     EXPECT_EQ(count, n);
     EXPECT_EQ(sum, n * (n + 1) / 2);
 }
+
+// ---- Producers x consumers ---------------------------------------------------
+
+// Each value carries (producer id, per-producer sequence number). What a
+// linearizable FIFO guarantees here:
+//   - every value comes out exactly once;
+//   - one consumer sees each producer's values in increasing order. A
+//     producer's pushes claim increasing positions, and a consumer's pops
+//     claim increasing positions too, so whatever one consumer gets from one
+//     producer arrives in push order. Across consumers there's no order to
+//     check: two consumers can finish their pops in either order.
+namespace {
+
+constexpr std::uint64_t make_tagged(std::uint64_t producer, std::uint64_t seq) {
+    return producer << 32 | seq;
+}
+constexpr std::uint64_t tag_producer(std::uint64_t v) { return v >> 32; }
+constexpr std::uint64_t tag_seq(std::uint64_t v) { return v & 0xffffffffu; }
+
+struct Shape {
+    std::size_t producers;
+    std::size_t consumers;
+};
+
+std::string shape_name(const ::testing::TestParamInfo<Shape>& info) {
+    return std::to_string(info.param.producers) + "p" + std::to_string(info.param.consumers) + "c";
+}
+
+std::vector<Shape> all_shapes() {
+    std::vector<Shape> shapes;
+    for (std::size_t p = 1; p <= 4; ++p) {
+        for (std::size_t c = 1; c <= 4; ++c) shapes.push_back({p, c});
+    }
+    return shapes;
+}
+
+} // namespace
+
+class MpmcProducersConsumers : public lockfree::test::StressTest,
+                               public ::testing::WithParamInterface<Shape> {};
+
+TEST_P(MpmcProducersConsumers, ExactlyOnceAndPerProducerOrder) {
+    const auto [producers, consumers] = GetParam();
+    const std::uint64_t per_producer = lockfree::test::scaled(20000);
+    const std::uint64_t total = producers * per_producer;
+
+    // Small on purpose: producers keep hitting full and consumers keep
+    // hitting empty, so the "lap behind" and "not pushed yet" paths both run.
+    MpmcQueue<std::uint64_t, 16> q;
+
+    // seen[p][s] counts how often (p, s) was popped. Each entry is written by
+    // whichever consumer popped it, hence atomic.
+    std::vector<std::vector<std::atomic<std::uint8_t>>> seen(producers);
+    for (auto& row : seen) row = std::vector<std::atomic<std::uint8_t>>(per_producer);
+
+    std::atomic<std::uint64_t> consumed{0};
+    std::atomic<std::uint64_t> order_violations{0};
+    std::atomic<std::uint64_t> bad_values{0};
+
+    lockfree::test::run_stress(producers + consumers, [&](std::size_t index,
+                                                          lockfree::test::StressRng& rng) {
+        if (index < producers) {
+            for (std::uint64_t s = 0; s < per_producer; ++s) {
+                while (!q.try_push(make_tagged(index, s))) std::this_thread::yield();
+                lockfree::test::maybe_delay(rng);
+            }
+            return;
+        }
+
+        // last[p] = one past the highest seq this consumer got from producer p.
+        std::vector<std::uint64_t> last(producers, 0);
+        while (consumed.load(std::memory_order_relaxed) < total) {
+            auto v = q.try_pop();
+            if (!v) {
+                std::this_thread::yield();
+                continue;
+            }
+            consumed.fetch_add(1, std::memory_order_relaxed);
+            const std::uint64_t p = tag_producer(*v), s = tag_seq(*v);
+            if (p >= producers || s >= per_producer) {
+                bad_values.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (s < last[p]) order_violations.fetch_add(1, std::memory_order_relaxed);
+            last[p] = s + 1;
+            seen[p][s].fetch_add(1, std::memory_order_relaxed);
+            lockfree::test::maybe_delay(rng);
+        }
+    });
+
+    EXPECT_EQ(bad_values.load(), 0u);
+    EXPECT_EQ(order_violations.load(), 0u);
+    EXPECT_EQ(consumed.load(), total);
+    EXPECT_TRUE(q.empty_approx());
+
+    std::uint64_t missing = 0, duplicated = 0;
+    for (const auto& row : seen) {
+        for (const auto& n : row) {
+            const auto c = n.load(std::memory_order_relaxed);
+            if (c == 0) ++missing;
+            if (c > 1) ++duplicated;
+        }
+    }
+    EXPECT_EQ(missing, 0u);
+    EXPECT_EQ(duplicated, 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(Shapes, MpmcProducersConsumers, ::testing::ValuesIn(all_shapes()),
+                         shape_name);
