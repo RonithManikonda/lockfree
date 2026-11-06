@@ -3,6 +3,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -11,6 +14,7 @@
 
 #include "lockfree/mpmc_queue.hpp"
 #include "stress_harness.hpp"
+#include "tracked.hpp"
 
 using lockfree::MpmcQueue;
 
@@ -178,6 +182,219 @@ TEST(MpmcQueue, NonTrivialElementsSurviveLaps) {
     }
     // Leave one behind so the destructor has something to drain under ASan.
     ASSERT_TRUE(q.try_push(std::string(64, 'z')));
+}
+
+// ---- Element types beyond int ------------------------------------------------
+
+TEST(MpmcQueue, MoveOnlyElements) {
+    MpmcQueue<std::unique_ptr<int>, 4> q;
+    ASSERT_TRUE(q.try_push(std::make_unique<int>(1)));
+    ASSERT_TRUE(q.try_emplace(new int(2)));
+    q.push(std::make_unique<int>(3));
+
+    std::unique_ptr<int> out;
+    ASSERT_TRUE(q.try_pop(out));
+    ASSERT_NE(out, nullptr);
+    EXPECT_EQ(*out, 1);
+
+    std::optional<std::unique_ptr<int>> opt = q.try_pop();
+    ASSERT_TRUE(opt.has_value());
+    EXPECT_EQ(**opt, 2);
+    EXPECT_EQ(*q.pop(), 3);
+    EXPECT_FALSE(q.try_pop().has_value());
+}
+
+TEST(MpmcQueue, NoDefaultConstructorNeeded) {
+    struct Pair {
+        Pair(int a, std::string b) : a(a), b(std::move(b)) {}
+        int a;
+        std::string b;
+    };
+    static_assert(!std::is_default_constructible_v<Pair>);
+
+    MpmcQueue<Pair, 2> q;
+    ASSERT_TRUE(q.try_emplace(1, "one"));
+    ASSERT_TRUE(q.try_emplace(2, std::string(40, 'x'))); // past SSO, heap-allocated
+    EXPECT_FALSE(q.try_emplace(3, "three"));
+
+    auto first = q.try_pop();
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->a, 1);
+    EXPECT_EQ(first->b, "one");
+    Pair second = q.pop();
+    EXPECT_EQ(second.b.size(), 40u);
+}
+
+// The throwing constructor runs before a cell is claimed (see try_emplace),
+// so the exception leaves no hole that would stall the consumers behind it.
+TEST(MpmcQueue, ThrowingConstructorLeavesQueueUnchanged) {
+    struct Picky {
+        explicit Picky(int v) : v(v) {
+            if (v < 0) throw std::invalid_argument("negative");
+        }
+        int v;
+    };
+
+    MpmcQueue<Picky, 4> q;
+    ASSERT_TRUE(q.try_emplace(7));
+    EXPECT_THROW(q.try_emplace(-1), std::invalid_argument);
+    EXPECT_THROW(q.emplace(-2), std::invalid_argument);
+    EXPECT_EQ(q.size_approx(), 1u);
+
+    ASSERT_TRUE(q.try_emplace(8));
+    EXPECT_EQ(q.try_pop()->v, 7);
+    EXPECT_EQ(q.try_pop()->v, 8);
+    EXPECT_FALSE(q.try_pop());
+}
+
+// ---- Object lifetimes ---------------------------------------------------------
+
+using lockfree::test::Tracked;
+
+class MpmcLifetime : public lockfree::test::TrackedTest {};
+
+TEST_F(MpmcLifetime, EmptyQueueConstructsNothing) {
+    MpmcQueue<Tracked, 64> q;
+    EXPECT_EQ(Tracked::live.load(), 0);
+}
+
+TEST_F(MpmcLifetime, OneLiveObjectPerQueuedElement) {
+    MpmcQueue<Tracked, 8> q;
+    for (int i = 0; i < 5; ++i) ASSERT_TRUE(q.try_emplace(i));
+    EXPECT_EQ(Tracked::live.load(), 5);
+
+    Tracked out(-1); // +1 live, held by the test
+    ASSERT_TRUE(q.try_pop(out));
+    EXPECT_EQ(out.value, 0);
+    EXPECT_EQ(Tracked::live.load(), 5); // 4 queued + out
+
+    {
+        auto opt = q.try_pop();
+        ASSERT_TRUE(opt);
+        EXPECT_EQ(opt->value, 1);
+        EXPECT_EQ(Tracked::live.load(), 5); // 3 queued + out + opt
+    }
+    EXPECT_EQ(Tracked::live.load(), 4);
+    {
+        Tracked p = q.pop();
+        EXPECT_EQ(p.value, 2);
+        EXPECT_EQ(Tracked::live.load(), 4); // 2 queued + out + p
+    }
+}
+
+TEST_F(MpmcLifetime, PushCopiesAndMovesWithoutLeaking) {
+    MpmcQueue<Tracked, 4> q;
+    Tracked a(1);
+    ASSERT_TRUE(q.try_push(a));            // copy
+    ASSERT_TRUE(q.try_push(Tracked(2)));   // move from a temporary
+    q.push(a);                             // blocking copy
+    EXPECT_EQ(Tracked::live.load(), 4);
+    EXPECT_EQ(a.value, 1);
+    EXPECT_EQ(q.try_pop()->value, 1);
+    EXPECT_EQ(q.try_pop()->value, 2);
+    EXPECT_EQ(q.try_pop()->value, 1);
+    EXPECT_EQ(Tracked::live.load(), 1);
+}
+
+TEST_F(MpmcLifetime, DestructorDrainsRemainingElements) {
+    {
+        MpmcQueue<Tracked, 8> q;
+        for (int i = 0; i < 8; ++i) ASSERT_TRUE(q.try_emplace(i));
+        for (int i = 0; i < 3; ++i) ASSERT_TRUE(q.try_pop());
+        EXPECT_EQ(Tracked::live.load(), 5);
+    }
+    // TearDown checks live == 0 and no double destroys.
+}
+
+TEST_F(MpmcLifetime, DestructorDrainsAcrossTheWrapPoint) {
+    // Leave elements straddling the end of the buffer so the drain loop has
+    // to follow the masked position back around to cell 0.
+    {
+        MpmcQueue<Tracked, 4> q;
+        for (int i = 0; i < 3; ++i) ASSERT_TRUE(q.try_emplace(i));
+        for (int i = 0; i < 3; ++i) ASSERT_TRUE(q.try_pop());
+        for (int i = 0; i < 4; ++i) ASSERT_TRUE(q.try_emplace(10 + i)); // cells 3,0,1,2
+        EXPECT_EQ(Tracked::live.load(), 4);
+    }
+}
+
+TEST_F(MpmcLifetime, ManyLapsKeepCountsBalanced) {
+    MpmcQueue<Tracked, 4> q;
+    for (int i = 0; i < 1000; ++i) {
+        ASSERT_TRUE(q.try_emplace(i));
+        if (i % 3 != 0) ASSERT_TRUE(q.try_pop());
+        ASSERT_LE(Tracked::live.load(), 4);
+        if (q.size_approx() == 4) {
+            while (q.try_pop()) {}
+        }
+    }
+}
+
+// Elements built on one thread and destroyed on another, across many laps.
+// The queue is left with whatever the consumers didn't get to, so the
+// destructor drain also runs on cells written by several producers.
+class MpmcLifetimeThreads : public lockfree::test::TrackedTest {};
+
+TEST_F(MpmcLifetimeThreads, CountsBalanceAcrossThreads) {
+    constexpr std::size_t producers = 3, consumers = 3;
+    constexpr int left = 2;
+    static_assert(consumers * left <= MpmcQueue<Tracked, 8>::capacity());
+    const int per_producer = static_cast<int>(lockfree::test::scaled(20000));
+    std::atomic<int> popped{0};
+    {
+        MpmcQueue<Tracked, 8> q;
+        lockfree::test::run_stress(producers + consumers, [&](std::size_t index,
+                                                              lockfree::test::StressRng& rng) {
+            if (index < producers) {
+                for (int i = 0; i < per_producer; ++i) {
+                    q.emplace(i);
+                    lockfree::test::maybe_delay(rng);
+                }
+                return;
+            }
+            // Each consumer stops `left` short, so some elements are left
+            // for the destructor. consumers * left must fit in the queue, or
+            // the producers' last pushes block forever.
+            for (int i = 0; i < per_producer - left; ++i) {
+                Tracked t = q.pop();
+                if (t.canary != Tracked::kAlive) Tracked::bad_destroys.fetch_add(1);
+                popped.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        EXPECT_EQ(Tracked::live.load(), static_cast<int>(consumers) * left);
+    }
+    EXPECT_EQ(popped.load(), static_cast<int>(consumers) * (per_producer - left));
+}
+
+// Ownership crosses threads: producers allocate, consumers free. ASan
+// catches a use-after-free or double free if a cell is handed out twice.
+class MpmcMoveOnlyThreads : public lockfree::test::StressTest {};
+
+TEST_F(MpmcMoveOnlyThreads, UniquePtrsChangeHandsExactlyOnce) {
+    constexpr std::size_t producers = 4, consumers = 4;
+    const std::uint64_t per_producer = lockfree::test::scaled(20000);
+    MpmcQueue<std::unique_ptr<std::uint64_t>, 16> q;
+    std::atomic<std::uint64_t> sum{0};
+
+    lockfree::test::run_stress(producers + consumers, [&](std::size_t index,
+                                                          lockfree::test::StressRng& rng) {
+        if (index < producers) {
+            for (std::uint64_t i = 1; i <= per_producer; ++i) {
+                q.push(std::make_unique<std::uint64_t>(i));
+                lockfree::test::maybe_delay(rng);
+            }
+            return;
+        }
+        std::uint64_t local = 0;
+        for (std::uint64_t i = 0; i < per_producer; ++i) {
+            std::unique_ptr<std::uint64_t> p = q.pop();
+            local += *p;
+        }
+        sum.fetch_add(local, std::memory_order_relaxed);
+    });
+
+    EXPECT_TRUE(q.empty_approx());
+    EXPECT_EQ(sum.load(), producers * per_producer * (per_producer + 1) / 2);
 }
 
 // ---- Blocking push / pop -----------------------------------------------------
