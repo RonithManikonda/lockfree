@@ -15,7 +15,8 @@ stress tests, linearizability checking, a deterministic scheduler) and a
 | Stress harness (`test/stress_harness.hpp`) | done: start barrier, seeded per-thread RNG, `LOCKFREE_SEED` / `LOCKFREE_STRESS_SCALE` |
 | Benchmarks (`bench/bench_spsc.cpp`) | SPSC throughput vs a mutex queue, ping-pong latency p50/p99/p99.9 |
 | Verification | `scripts/check.sh` (Debug, TSan, ASan, UBSan); CI on Linux gcc/clang and macOS arm64 |
-| MPMC, MPSC, atomic stack, reclamation, primitives | not started (headers are stubs) |
+| `MpmcQueue<T, N>` | done: unit + producers x consumers stress tests, throughput bench, [design notes](docs/mpmc_queue.md) |
+| MPSC, atomic stack, reclamation, primitives | not started (headers are stubs) |
 | Linearizability checker, adversarial scheduler | not started |
 
 ## Usage
