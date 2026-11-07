@@ -27,6 +27,8 @@ foreach(test ${LOCKFREE_TESTS})
   add_executable(${test} ${test}.cpp)
   target_link_libraries(${test} PRIVATE lockfree GTest::gtest_main)
   target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # Turns LOCKFREE_TEST_HOOK(name) points into callbacks tests can install.
+  target_compile_definitions(${test} PRIVATE LOCKFREE_TEST_HOOKS)
   add_test(NAME ${test} COMMAND ${test})
 endforeach()
 
