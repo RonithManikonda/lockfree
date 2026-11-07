@@ -1,6 +1,11 @@
 #pragma once
 #include <atomic>
+#include <memory>
+#include <optional>
+#include <type_traits>
+#include <utility>
 
+#include "lockfree/atomic_backoff.hpp"
 #include "lockfree/detail/cache_line.hpp"
 
 namespace lockfree {
@@ -112,6 +117,92 @@ private:
     alignas(detail::cache_line_size) std::atomic<MpscNode*> tail_{&stub_};
     alignas(detail::cache_line_size) MpscNode* head_{&stub_};
     alignas(detail::cache_line_size) MpscNode stub_;
+};
+
+// MpscIntrusiveQueue for plain values: each push allocates a node and the
+// consumer frees it. Unbounded, so push only fails by throwing bad_alloc.
+//
+// Freeing right after the pop is safe because there's one consumer and a node
+// only comes back once its successor is linked, so no other thread can still
+// be looking at it. With several consumers another one could still be reading
+// the node, which is why those queues need hazard pointers or epochs.
+template <typename T>
+class MpscQueue {
+    static_assert(std::is_nothrow_destructible_v<T>,
+                  "pop and the destructor can't recover from a throwing ~T");
+    static_assert(std::is_nothrow_move_constructible_v<T>,
+                  "a popped node has already left the queue, so moving out must not throw");
+
+public:
+    MpscQueue() = default;
+    MpscQueue(const MpscQueue&) = delete;
+    MpscQueue& operator=(const MpscQueue&) = delete;
+
+    // Frees whatever was pushed and never popped. Must not race with any push
+    // or pop. With no push in progress, pop can see every node.
+    ~MpscQueue() {
+        while (MpscNode* n = queue_.pop()) delete static_cast<Node*>(n);
+    }
+
+    // Any thread. If the allocation or T's constructor throws, the queue is
+    // unchanged.
+    template <typename... Args>
+    void emplace(Args&&... args) {
+        queue_.push(new Node(std::forward<Args>(args)...));
+    }
+
+    void push(const T& item) { emplace(item); }
+
+    void push(T&& item) { emplace(std::move(item)); }
+
+    // Consumer thread only. Move-assigns into `out`. As with the core, false
+    // can also mean a producer is part-way through a push.
+    bool try_pop(T& out) noexcept
+        requires std::is_nothrow_move_assignable_v<T>
+    {
+        std::unique_ptr<Node> n = pop_node();
+        if (!n) return false;
+        out = std::move(n->value);
+        return true;
+    }
+
+    // Consumer thread only. Works for types that aren't default-constructible
+    // or assignable.
+    std::optional<T> try_pop() noexcept {
+        std::unique_ptr<Node> n = pop_node();
+        if (!n) return std::nullopt;
+        return std::optional<T>(std::move(n->value));
+    }
+
+    // Consumer thread only. Spins with Backoff until an item arrives, and never
+    // gives up, so it waits forever if nothing is ever pushed.
+    T pop() noexcept {
+        Backoff backoff;
+        for (;;) {
+            if (std::unique_ptr<Node> n = pop_node()) return std::move(n->value);
+            backoff.pause();
+        }
+    }
+
+    void pop(T& out) noexcept
+        requires std::is_nothrow_move_assignable_v<T>
+    {
+        Backoff backoff;
+        while (!try_pop(out)) backoff.pause();
+    }
+
+private:
+    struct Node : MpscNode {
+        template <typename... Args>
+        explicit Node(Args&&... args) : value(std::forward<Args>(args)...) {}
+        T value;
+    };
+
+    std::unique_ptr<Node> pop_node() noexcept {
+        return std::unique_ptr<Node>(static_cast<Node*>(queue_.pop()));
+    }
+
+    MpscIntrusiveQueue queue_;
 };
 
 } // namespace lockfree

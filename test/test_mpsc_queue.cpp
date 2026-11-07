@@ -3,11 +3,16 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "lockfree/mpsc_queue.hpp"
 #include "stress_harness.hpp"
+#include "tracked.hpp"
 
 namespace lockfree {
 
@@ -28,6 +33,8 @@ namespace {
 using lockfree::MpscIntrusiveQueue;
 using lockfree::MpscNode;
 using Access = lockfree::MpscIntrusiveQueueTestAccess;
+using lockfree::MpscQueue;
+using lockfree::test::Tracked;
 
 struct Item : MpscNode {
     explicit Item(std::uint64_t v = 0) : value(v) {}
@@ -221,6 +228,135 @@ TEST_F(MpscIntrusiveStress, ProducersDeliverExactlyOnceInOrder) {
     EXPECT_EQ(popped, items.size());
     EXPECT_EQ(order_violations, 0u);
     EXPECT_EQ(q.pop(), nullptr);
+}
+
+TEST(MpscQueue, TryPopOnEmptyFails) {
+    MpscQueue<int> q;
+    int out = 7;
+    EXPECT_FALSE(q.try_pop(out));
+    EXPECT_EQ(out, 7);
+    EXPECT_EQ(q.try_pop(), std::nullopt);
+}
+
+TEST(MpscQueue, FifoThroughBothPopForms) {
+    MpscQueue<int> q;
+    for (int i = 0; i < 6; ++i) q.push(i);
+    int out = -1;
+    ASSERT_TRUE(q.try_pop(out));
+    EXPECT_EQ(out, 0);
+    EXPECT_EQ(q.try_pop(), 1);
+    EXPECT_EQ(q.pop(), 2);
+    q.pop(out);
+    EXPECT_EQ(out, 3);
+    EXPECT_EQ(q.try_pop(), 4);
+    EXPECT_EQ(q.try_pop(), 5);
+    EXPECT_EQ(q.try_pop(), std::nullopt);
+}
+
+TEST(MpscQueue, EmplaceForwardsConstructorArgs) {
+    MpscQueue<std::string> q;
+    q.emplace(3u, 'x');
+    EXPECT_EQ(q.try_pop(), "xxx");
+}
+
+TEST(MpscQueue, PushCopiesAnLvalue) {
+    MpscQueue<std::string> q;
+    const std::string s = "kept";
+    q.push(s);
+    EXPECT_EQ(s, "kept");
+    EXPECT_EQ(q.try_pop(), "kept");
+}
+
+TEST(MpscQueue, MoveOnlyType) {
+    MpscQueue<std::unique_ptr<int>> q;
+    q.push(std::make_unique<int>(1));
+    q.emplace(std::make_unique<int>(2));
+
+    auto first = q.try_pop();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(**first, 1);
+
+    std::unique_ptr<int> second;
+    ASSERT_TRUE(q.try_pop(second));
+    EXPECT_EQ(*second, 2);
+}
+
+// A type with no default constructor and no assignment still has to work
+// through the optional-returning and blocking pops.
+TEST(MpscQueue, NonAssignableType) {
+    struct Fixed {
+        explicit Fixed(int v) : value(v) {}
+        Fixed(Fixed&&) noexcept = default;
+        Fixed& operator=(Fixed&&) = delete;
+        int value;
+    };
+    MpscQueue<Fixed> q;
+    q.emplace(1);
+    q.emplace(2);
+    EXPECT_EQ(q.try_pop()->value, 1);
+    EXPECT_EQ(q.pop().value, 2);
+}
+
+TEST(MpscQueue, ThrowingConstructorLeavesQueueUnchanged) {
+    struct Picky {
+        explicit Picky(int v) : value(v) {
+            if (v < 0) throw std::invalid_argument("negative");
+        }
+        Picky(Picky&&) noexcept = default;
+        int value;
+    };
+    MpscQueue<Picky> q;
+    q.emplace(1);
+    EXPECT_THROW(q.emplace(-1), std::invalid_argument);
+    q.emplace(2);
+    EXPECT_EQ(q.try_pop()->value, 1);
+    EXPECT_EQ(q.try_pop()->value, 2);
+    EXPECT_EQ(q.try_pop(), std::nullopt);
+}
+
+class MpscQueueLifetime : public lockfree::test::TrackedTest {};
+
+TEST_F(MpscQueueLifetime, PopDestroysTheNodesCopy) {
+    MpscQueue<Tracked> q;
+    q.emplace(5);
+    EXPECT_EQ(Tracked::live.load(), 1);
+    {
+        auto v = q.try_pop();
+        ASSERT_TRUE(v.has_value());
+        EXPECT_EQ(v->value, 5);
+        EXPECT_EQ(Tracked::live.load(), 1) << "only the popped value is left";
+    }
+    EXPECT_EQ(Tracked::live.load(), 0);
+}
+
+TEST_F(MpscQueueLifetime, TryPopIntoExistingObject) {
+    MpscQueue<Tracked> q;
+    q.emplace(5);
+    Tracked out(0);
+    ASSERT_TRUE(q.try_pop(out));
+    EXPECT_EQ(out.value, 5);
+    EXPECT_EQ(Tracked::live.load(), 1);
+}
+
+TEST_F(MpscQueueLifetime, DestructorDrainsWhatsLeft) {
+    {
+        MpscQueue<Tracked> q;
+        for (int i = 0; i < 100; ++i) q.emplace(i);
+        for (int i = 0; i < 40; ++i) q.try_pop();
+        EXPECT_EQ(Tracked::live.load(), 60);
+    }
+    EXPECT_EQ(Tracked::live.load(), 0);
+}
+
+// The stub is the last thing in the list after a drain; a destructor that went
+// wrong here would try to delete it, which ASan would catch.
+TEST_F(MpscQueueLifetime, DestructorAfterFullDrain) {
+    MpscQueue<Tracked> q;
+    q.emplace(1);
+    q.emplace(2);
+    q.try_pop();
+    q.try_pop();
+    EXPECT_FALSE(q.try_pop().has_value());
 }
 
 } // namespace
