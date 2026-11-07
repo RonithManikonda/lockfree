@@ -1,14 +1,21 @@
+#include <lockfree/atomic_stack.hpp>
 #include <lockfree/naive/treiber_stack.hpp>
+
+#include "tracked.hpp"
 
 #include <gtest/gtest.h>
 
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
+using lockfree::AtomicStack;
 using lockfree::detail::ScopedTestHook;
+using lockfree::test::Tracked;
 using lockfree::naive::NodePool;
 using lockfree::naive::TreiberStack;
 
@@ -212,4 +219,206 @@ TEST(NaiveTreiberAba, CasStillSucceedsAfterHeadChangedAndChangedBack) {
     }
     EXPECT_EQ(hook_calls, 1) << "a retry would mean the CAS noticed the change";
     EXPECT_EQ(s.try_pop(), 2);
+}
+
+// ---- TaggedAtomic ------------------------------------------------------------
+
+namespace {
+
+struct Dummy {
+    int x = 0;
+};
+
+template <typename Tagged>
+void expect_cas_bumps_tag_and_rejects_stale_tag() {
+    Dummy a, b;
+    Tagged t;
+    auto v = t.load(std::memory_order_relaxed);
+    EXPECT_EQ(v.ptr, nullptr);
+    EXPECT_EQ(v.tag, 0u);
+
+    ASSERT_TRUE(t.compare_exchange_weak(v, &a, std::memory_order_relaxed, std::memory_order_relaxed));
+    auto stale = t.load(std::memory_order_relaxed);  // {a, 1}
+    EXPECT_EQ(stale.ptr, &a);
+    EXPECT_EQ(stale.tag, 1u);
+
+    // a -> b -> a: same pointer, two versions later.
+    auto cur = stale;
+    ASSERT_TRUE(t.compare_exchange_weak(cur, &b, std::memory_order_relaxed, std::memory_order_relaxed));
+    cur = t.load(std::memory_order_relaxed);
+    ASSERT_TRUE(t.compare_exchange_weak(cur, &a, std::memory_order_relaxed, std::memory_order_relaxed));
+
+    auto expected = stale;
+    EXPECT_FALSE(t.compare_exchange_weak(expected, nullptr, std::memory_order_relaxed,
+                                         std::memory_order_relaxed))
+        << "a CAS with the old tag must fail even though the pointer matches";
+    EXPECT_EQ(expected.ptr, &a);
+    EXPECT_EQ(expected.tag, 3u) << "a failed CAS reports the current version";
+}
+
+} // namespace
+
+TEST(TaggedAtomic, PackedRejectsStaleTag) {
+    expect_cas_bumps_tag_and_rejects_stale_tag<lockfree::detail::TaggedAtomic<Dummy, false>>();
+}
+
+TEST(TaggedAtomic, DefaultRepresentationRejectsStaleTag) {
+    expect_cas_bumps_tag_and_rejects_stale_tag<lockfree::detail::TaggedAtomic<Dummy>>();
+}
+
+TEST(TaggedAtomic, PackedTagWrapsAt16BitsWithoutTouchingThePointer) {
+    using Packed = lockfree::detail::TaggedAtomic<Dummy, false>;
+    Dummy d;
+    Packed t;
+    auto v = t.load(std::memory_order_relaxed);
+    ASSERT_TRUE(t.compare_exchange_weak(v, &d, std::memory_order_relaxed, std::memory_order_relaxed));
+    for (int i = 1; i < 0x10000; ++i) {
+        v = t.load(std::memory_order_relaxed);
+        while (!t.compare_exchange_weak(v, &d, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+    v = t.load(std::memory_order_relaxed);
+    EXPECT_EQ(v.ptr, &d);
+    EXPECT_EQ(v.tag, 0u) << "65536 changes bring a 16-bit tag back around";
+}
+
+// ---- AtomicStack, single-threaded contract -----------------------------------
+
+TEST(AtomicStack, PopOnEmptyFails) {
+    AtomicStack<int> s;
+    EXPECT_TRUE(s.empty_approx());
+    EXPECT_EQ(s.try_pop(), std::nullopt);
+    int out = -1;
+    EXPECT_FALSE(s.try_pop(out));
+    EXPECT_EQ(out, -1);
+}
+
+TEST(AtomicStack, LastInFirstOutThroughBothPopForms) {
+    AtomicStack<int> s;
+    for (int i = 0; i < 10; ++i) s.push(i);
+    for (int i = 9; i >= 0; i -= 2) {
+        EXPECT_EQ(s.try_pop(), i);
+        int out = -1;
+        ASSERT_TRUE(s.try_pop(out));
+        EXPECT_EQ(out, i - 1);
+    }
+    EXPECT_TRUE(s.empty_approx());
+}
+
+TEST(AtomicStack, ManyRoundsReuseNodes) {
+    AtomicStack<int> s;
+    for (int round = 0; round < 1000; ++round) {
+        for (int i = 0; i < 5; ++i) s.push(round * 10 + i);
+        for (int i = 4; i >= 0; --i) ASSERT_EQ(s.try_pop(), round * 10 + i);
+    }
+}
+
+TEST(AtomicStack, MoveOnlyType) {
+    AtomicStack<std::unique_ptr<int>> s;
+    s.push(std::make_unique<int>(1));
+    s.emplace(new int(2));
+    auto top = s.try_pop();
+    ASSERT_TRUE(top && *top);
+    EXPECT_EQ(**top, 2);
+    std::unique_ptr<int> out;
+    ASSERT_TRUE(s.try_pop(out));
+    EXPECT_EQ(*out, 1);
+}
+
+TEST(AtomicStack, ThrowingConstructorLeavesStackUnchanged) {
+    struct Picky {
+        explicit Picky(int v) : value(v) {
+            if (v < 0) throw std::invalid_argument("negative");
+        }
+        Picky(Picky&&) noexcept = default;
+        int value;
+    };
+    AtomicStack<Picky> s;
+    s.emplace(1);
+    EXPECT_THROW(s.emplace(-1), std::invalid_argument);
+    s.emplace(2);  // takes the node the failed emplace gave back
+    auto a = s.try_pop();
+    auto b = s.try_pop();
+    ASSERT_TRUE(a && b);
+    EXPECT_EQ(a->value, 2);
+    EXPECT_EQ(b->value, 1);
+    EXPECT_FALSE(s.try_pop());
+}
+
+class AtomicStackLifetime : public lockfree::test::TrackedTest {};
+
+TEST_F(AtomicStackLifetime, PopDestroysTheStoredObject) {
+    AtomicStack<Tracked> s;
+    s.emplace(1);
+    s.emplace(2);
+    EXPECT_EQ(Tracked::live.load(), 2);
+    {
+        auto v = s.try_pop();
+        ASSERT_TRUE(v);
+        EXPECT_EQ(v->value, 2);
+        EXPECT_EQ(Tracked::live.load(), 2) << "the node's copy should be gone, only *v and 1 left";
+    }
+    EXPECT_EQ(Tracked::live.load(), 1);
+}
+
+TEST_F(AtomicStackLifetime, DestructorDestroysWhatsLeft) {
+    {
+        AtomicStack<Tracked> s;
+        for (int i = 0; i < 5; ++i) s.emplace(i);
+        Tracked out(0);
+        ASSERT_TRUE(s.try_pop(out));
+        EXPECT_EQ(out.value, 4);
+    }
+    // TearDown checks nothing leaked and nothing was destroyed twice.
+}
+
+// ---- AtomicStack under the same ABA interleavings ----------------------------
+
+TEST(AtomicStackAba, CasFailsWhenHeadChangedAndChangedBack) {
+    // Same as NaiveTreiberAba.CasStillSucceedsAfterHeadChangedAndChangedBack:
+    // B pops X and pushes 99, which lands in the same node. head's pointer is
+    // X again, but its tag moved on, so A's CAS fails and A retries.
+    AtomicStack<int> s;
+    s.push(2);
+    s.push(1);
+    int hook_calls = 0;
+    {
+        ScopedTestHook hook([&](std::string_view where) {
+            if (where != "atomic_stack_pop_before_cas") return;
+            if (++hook_calls > 1) return;
+            EXPECT_EQ(s.try_pop(), 1);
+            s.push(99);
+        });
+        EXPECT_EQ(s.try_pop(), 99);
+    }
+    EXPECT_EQ(hook_calls, 2) << "A should have retried after its CAS failed";
+    EXPECT_EQ(s.try_pop(), 2);
+    EXPECT_EQ(s.try_pop(), std::nullopt);
+}
+
+TEST(AtomicStackAba, StalePopRetriesAfterADrainAndRefill) {
+    // B empties the stack and refills it. The free list hands the nodes back
+    // in reverse, so X ends up on top again, three versions later.
+    AtomicStack<int> s;
+    s.push(3);
+    s.push(2);
+    s.push(1);  // X(1) -> Y(2) -> Z(3); A reads head = X, next = Y
+    int hook_calls = 0;
+    {
+        ScopedTestHook hook([&](std::string_view where) {
+            if (where != "atomic_stack_pop_before_cas") return;
+            if (++hook_calls > 1) return;
+            EXPECT_EQ(s.try_pop(), 1);
+            EXPECT_EQ(s.try_pop(), 2);
+            EXPECT_EQ(s.try_pop(), 3);
+            s.push(30);
+            s.push(40);
+            s.push(50);  // X(50) -> Y(40) -> Z(30)
+        });
+        EXPECT_EQ(s.try_pop(), 50);
+    }
+    EXPECT_EQ(hook_calls, 2) << "A should have retried after its CAS failed";
+    EXPECT_EQ(s.try_pop(), 40);
+    EXPECT_EQ(s.try_pop(), 30);
+    EXPECT_EQ(s.try_pop(), std::nullopt);
 }
