@@ -359,4 +359,154 @@ TEST_F(MpscQueueLifetime, DestructorAfterFullDrain) {
     EXPECT_FALSE(q.try_pop().has_value());
 }
 
+// Producers x one consumer: every value tagged (producer, seq). The consumer
+// is the only thread reading the tallies, so they don't need to be atomic.
+class MpscProducers : public lockfree::test::StressTest,
+                      public ::testing::WithParamInterface<std::size_t> {};
+
+TEST_P(MpscProducers, ExactlyOnceAndPerProducerOrder) {
+    const std::size_t producers = GetParam();
+    const std::uint64_t per_producer = lockfree::test::scaled(20000);
+    const std::uint64_t total = producers * per_producer;
+
+    MpscQueue<std::uint64_t> q;
+    std::vector<std::uint8_t> seen(total, 0);
+    std::vector<std::uint64_t> next(producers, 0);
+    std::uint64_t popped = 0, order_violations = 0, bad_values = 0;
+
+    lockfree::test::run_stress(producers + 1, [&](std::size_t index,
+                                                  lockfree::test::StressRng& rng) {
+        if (index < producers) {
+            for (std::uint64_t s = 0; s < per_producer; ++s) {
+                q.push(index * per_producer + s);
+                lockfree::test::maybe_delay(rng);
+            }
+            return;
+        }
+        while (popped < total) {
+            auto v = q.try_pop();
+            if (!v) {
+                std::this_thread::yield();
+                continue;
+            }
+            ++popped;
+            if (*v >= total) {
+                ++bad_values;
+                continue;
+            }
+            const std::uint64_t p = *v / per_producer, s = *v % per_producer;
+            if (s != next[p]) ++order_violations;
+            next[p] = s + 1;
+            ++seen[*v];
+            lockfree::test::maybe_delay(rng);
+        }
+    });
+
+    EXPECT_EQ(popped, total);
+    EXPECT_EQ(bad_values, 0u);
+    EXPECT_EQ(order_violations, 0u);
+    EXPECT_EQ(q.try_pop(), std::nullopt);
+
+    std::uint64_t wrong = 0;
+    for (auto n : seen) wrong += n != 1;
+    EXPECT_EQ(wrong, 0u) << "values missing or popped more than once";
+}
+
+// Same, through the blocking pop, with the consumer told how many to expect.
+TEST_P(MpscProducers, BlockingPopExactlyOnce) {
+    const std::size_t producers = GetParam();
+    const std::uint64_t per_producer = lockfree::test::scaled(10000);
+    const std::uint64_t total = producers * per_producer;
+
+    MpscQueue<std::uint64_t> q;
+    std::vector<std::uint8_t> seen(total, 0);
+
+    lockfree::test::run_stress(producers + 1, [&](std::size_t index,
+                                                  lockfree::test::StressRng& rng) {
+        if (index < producers) {
+            for (std::uint64_t s = 0; s < per_producer; ++s) {
+                q.push(index * per_producer + s);
+                lockfree::test::maybe_delay(rng);
+            }
+            return;
+        }
+        for (std::uint64_t i = 0; i < total; ++i) {
+            const std::uint64_t v = q.pop();
+            if (v < total) ++seen[v];
+        }
+    });
+
+    EXPECT_EQ(q.try_pop(), std::nullopt);
+    std::uint64_t wrong = 0;
+    for (auto n : seen) wrong += n != 1;
+    EXPECT_EQ(wrong, 0u) << "values missing or popped more than once";
+}
+
+// Slow producers keep the queue near empty, so the consumer keeps pushing the
+// stub while producers are pushing too. That's the path with the most ways to
+// go wrong, and a fast producer loop rarely gets there.
+TEST_P(MpscProducers, NearlyEmptyQueueKeepsCyclingTheStub) {
+    const std::size_t producers = GetParam();
+    const std::uint64_t per_producer = lockfree::test::scaled(3000);
+    const std::uint64_t total = producers * per_producer;
+
+    MpscQueue<std::uint64_t> q;
+    std::vector<std::uint64_t> next(producers, 0);
+    std::uint64_t popped = 0, order_violations = 0;
+
+    lockfree::test::run_stress(producers + 1, [&](std::size_t index,
+                                                  lockfree::test::StressRng& rng) {
+        if (index < producers) {
+            for (std::uint64_t s = 0; s < per_producer; ++s) {
+                q.push(index * per_producer + s);
+                if (rng.below(4) == 0) std::this_thread::yield();
+            }
+            return;
+        }
+        while (popped < total) {
+            auto v = q.try_pop();
+            if (!v) continue;  // no yield: stay ahead of the producers
+            const std::uint64_t p = *v / per_producer, s = *v % per_producer;
+            if (s != next[p]) ++order_violations;
+            next[p] = s + 1;
+            ++popped;
+        }
+    });
+
+    EXPECT_EQ(popped, total);
+    EXPECT_EQ(order_violations, 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(Shapes, MpscProducers, ::testing::Values(1, 2, 3, 4, 8),
+                         [](const auto& info) { return std::to_string(info.param) + "p"; });
+
+class MpscQueueThreadedLifetime : public lockfree::test::TrackedTest {};
+
+// The consumer stops early, so the destructor frees the rest. Tracked's counters
+// catch leaks and double destroys, and ASan catches a bad free.
+TEST_F(MpscQueueThreadedLifetime, ProducersRaceConsumerThenDestructorDrains) {
+    constexpr std::size_t producers = 4;
+    const std::uint64_t per_producer = lockfree::test::scaled(5000);
+    const std::uint64_t to_pop = producers * per_producer / 2;
+    {
+        MpscQueue<Tracked> q;
+        lockfree::test::run_stress(producers + 1, [&](std::size_t index,
+                                                      lockfree::test::StressRng&) {
+            if (index < producers) {
+                for (std::uint64_t s = 0; s < per_producer; ++s) {
+                    q.emplace(static_cast<int>(s));
+                }
+                return;
+            }
+            for (std::uint64_t popped = 0; popped < to_pop;) {
+                if (q.try_pop()) ++popped;
+                else std::this_thread::yield();
+            }
+        });
+        EXPECT_EQ(static_cast<std::uint64_t>(Tracked::live.load()),
+                  producers * per_producer - to_pop);
+    }
+    EXPECT_EQ(Tracked::live.load(), 0);
+}
+
 } // namespace
