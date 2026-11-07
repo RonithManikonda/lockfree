@@ -16,7 +16,8 @@ stress tests, linearizability checking, a deterministic scheduler) and a
 | Benchmarks (`bench/bench_spsc.cpp`) | SPSC throughput vs a mutex queue, ping-pong latency p50/p99/p99.9 |
 | Verification | `scripts/check.sh` (Debug, TSan, ASan, UBSan); CI on Linux gcc/clang and macOS arm64 |
 | `MpmcQueue<T, N>` | done: unit + producers x consumers stress tests, throughput bench, [design notes](docs/mpmc_queue.md) |
-| MPSC, atomic stack, reclamation, primitives | not started (headers are stubs) |
+| `MpscQueue<T>`, `MpscIntrusiveQueue` | unit + 1..8 producer stress tests, N:1 throughput bench; design notes still to come |
+| Atomic stack, reclamation, primitives | not started (headers are stubs) |
 | Linearizability checker, adversarial scheduler | not started |
 
 ## Usage
