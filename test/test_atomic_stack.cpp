@@ -1,10 +1,12 @@
 #include <lockfree/atomic_stack.hpp>
 #include <lockfree/naive/treiber_stack.hpp>
 
+#include "stress_harness.hpp"
 #include "tracked.hpp"
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -421,4 +423,113 @@ TEST(AtomicStackAba, StalePopRetriesAfterADrainAndRefill) {
     EXPECT_EQ(s.try_pop(), 40);
     EXPECT_EQ(s.try_pop(), 30);
     EXPECT_EQ(s.try_pop(), std::nullopt);
+}
+
+// ---- AtomicStack under many threads ------------------------------------------
+
+class AtomicStackThreads : public lockfree::test::StressTest,
+                           public ::testing::WithParamInterface<std::size_t> {};
+
+TEST_P(AtomicStackThreads, MixedPushPopDeliversEveryValueExactlyOnce) {
+    // Every thread pushes its own range and pops whatever it finds, so pushes
+    // and pops of the same nodes overlap constantly.
+    const std::size_t threads = GetParam();
+    const std::uint64_t per_thread = lockfree::test::scaled(20000);
+    const std::uint64_t total = threads * per_thread;
+
+    AtomicStack<std::uint64_t> s;
+    std::vector<std::vector<std::uint64_t>> popped(threads);
+
+    lockfree::test::run_stress(threads, [&](std::size_t index, lockfree::test::StressRng& rng) {
+        auto& mine = popped[index];
+        mine.reserve(per_thread);
+        for (std::uint64_t i = 0; i < per_thread; ++i) {
+            s.push(index * per_thread + i);
+            lockfree::test::maybe_delay(rng);
+            // Pop about as often as we push, sometimes twice in a row, so the
+            // stack keeps swinging between nearly empty and a little full.
+            for (int pops = static_cast<int>(rng.below(3)); pops > 0; --pops) {
+                if (auto v = s.try_pop()) mine.push_back(*v);
+            }
+        }
+    });
+
+    std::vector<std::uint8_t> seen(total, 0);
+    std::uint64_t bad_values = 0, count = 0;
+    auto record = [&](std::uint64_t v) {
+        ++count;
+        if (v >= total) {
+            ++bad_values;
+            return;
+        }
+        ++seen[v];
+    };
+    for (const auto& mine : popped) {
+        for (auto v : mine) record(v);
+    }
+    while (auto v = s.try_pop()) record(*v);
+
+    EXPECT_EQ(bad_values, 0u);
+    EXPECT_EQ(count, total);
+    std::uint64_t wrong = 0;
+    for (auto n : seen) wrong += n != 1;
+    EXPECT_EQ(wrong, 0u) << "values missing or popped more than once";
+}
+
+TEST_P(AtomicStackThreads, TokensSurviveHeavyNodeReuse) {
+    // A handful of tokens bounce between the stack and the threads. With so
+    // few nodes, the same few addresses come back to the top over and over,
+    // which is exactly when an untagged CAS would lose or duplicate a token.
+    const std::size_t threads = GetParam();
+    const std::size_t tokens = threads;
+    const std::uint64_t rounds = lockfree::test::scaled(50000);
+
+    AtomicStack<std::uint64_t> s;
+    for (std::size_t t = 0; t < tokens; ++t) s.push(t);
+    std::vector<std::uint64_t> handled(tokens, 0);  // per token, written only by its holder
+
+    lockfree::test::run_stress(threads, [&](std::size_t, lockfree::test::StressRng& rng) {
+        for (std::uint64_t r = 0; r < rounds; ++r) {
+            auto t = s.try_pop();
+            if (!t) continue;
+            // Holding the token means no other thread has it, so this plain
+            // increment is race-free, and TSan would say so if the stack ever
+            // handed one token to two threads.
+            if (*t < tokens) ++handled[*t];
+            lockfree::test::maybe_delay(rng);
+            s.push(*t);
+        }
+    });
+
+    std::vector<std::uint8_t> seen(tokens, 0);
+    std::size_t count = 0;
+    while (auto t = s.try_pop()) {
+        ++count;
+        if (*t < tokens) ++seen[*t];
+    }
+    EXPECT_EQ(count, tokens);
+    for (std::size_t t = 0; t < tokens; ++t) EXPECT_EQ(seen[t], 1) << "token " << t;
+    std::uint64_t total_handled = 0;
+    for (auto h : handled) total_handled += h;
+    EXPECT_GT(total_handled, 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(Threads, AtomicStackThreads, ::testing::Values(2, 4, 8),
+                         [](const auto& info) { return std::to_string(info.param) + "threads"; });
+
+class AtomicStackThreadedLifetime : public lockfree::test::TrackedTest {};
+
+TEST_F(AtomicStackThreadedLifetime, RacingPushPopThenDestructorDrains) {
+    const std::uint64_t per_thread = lockfree::test::scaled(5000);
+    {
+        AtomicStack<Tracked> s;
+        lockfree::test::run_stress(4, [&](std::size_t index, lockfree::test::StressRng& rng) {
+            for (std::uint64_t i = 0; i < per_thread; ++i) {
+                s.emplace(static_cast<int>(index));
+                if (rng.below(4) != 0) s.try_pop();
+            }
+        });
+        EXPECT_GT(Tracked::live.load(), 0) << "some elements should be left for the destructor";
+    }
+    // TearDown checks the destructor destroyed exactly what was left.
 }
