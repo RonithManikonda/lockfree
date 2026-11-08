@@ -17,7 +17,8 @@ stress tests, linearizability checking, a deterministic scheduler) and a
 | Verification | `scripts/check.sh` (Debug, TSan, ASan, UBSan); CI on Linux gcc/clang and macOS arm64 |
 | `MpmcQueue<T, N>` | done: unit + producers x consumers stress tests, throughput bench, [design notes](docs/mpmc_queue.md) |
 | `MpscQueue<T>`, `MpscIntrusiveQueue` | done: unit + 1..8 producer stress tests, N:1 throughput bench, [design notes](docs/mpsc_queue.md) |
-| Atomic stack, reclamation, primitives | not started (headers are stubs) |
+| `AtomicStack<T>` | tagged-pointer head + node free list; ABA reproduced on `naive::TreiberStack` and shown fixed; 2..8 thread stress; bench vs a mutex stack; design notes still to come |
+| Reclamation, primitives | not started (headers are stubs) |
 | Linearizability checker, adversarial scheduler | not started |
 
 ## Usage

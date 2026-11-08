@@ -7,6 +7,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "lockfree/atomic_backoff.hpp"
 #include "lockfree/detail/cache_line.hpp"
 #include "lockfree/detail/tagged_ptr.hpp"
 #include "lockfree/detail/test_hook.hpp"
@@ -115,18 +116,26 @@ private:
 
     static void push_node(Head& head, Node* n) noexcept {
         auto expected = head.load(std::memory_order_relaxed);
-        do {
+        Backoff backoff;
+        for (;;) {
             n->next.store(expected.ptr, std::memory_order_relaxed);
             // release publishes the node: its value for the item stack, and
             // the destroyed-and-done state for the free list.
-        } while (!head.compare_exchange_weak(expected, n, std::memory_order_release,
-                                             std::memory_order_relaxed));
+            if (head.compare_exchange_weak(expected, n, std::memory_order_release,
+                                           std::memory_order_relaxed)) {
+                return;
+            }
+            // Everyone is after the same line. Retrying at once mostly just
+            // steals it back from whoever is about to succeed.
+            backoff.pause();
+        }
     }
 
     static Node* pop_node(Head& head, [[maybe_unused]] const char* hook) noexcept {
         // acquire pairs with push_node's release, so the node's value and next
         // are visible before we use them.
         auto expected = head.load(std::memory_order_acquire);
+        Backoff backoff;
         for (;;) {
             if (expected.ptr == nullptr) return nullptr;
             // If another thread pops this node first, next may be stale or
@@ -140,6 +149,7 @@ private:
                                            std::memory_order_acquire)) {
                 return expected.ptr;
             }
+            backoff.pause();
         }
     }
 
