@@ -21,6 +21,7 @@ set(LOCKFREE_TESTS
   interleaving_test
   test_latency_histogram
   test_atomic_backoff
+  test_lin_history
 )
 
 foreach(test ${LOCKFREE_TESTS})
@@ -34,3 +35,6 @@ endforeach()
 
 # The latency histogram lives with the benches but is plain logic worth testing.
 target_include_directories(test_latency_histogram PRIVATE ${PROJECT_SOURCE_DIR}/bench)
+
+# Linearizability history model and specs (header-only under tools/).
+target_include_directories(test_lin_history PRIVATE ${PROJECT_SOURCE_DIR}/tools)
