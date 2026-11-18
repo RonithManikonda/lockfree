@@ -1,0 +1,7 @@
+# Two producers and a consumer; pushes of 1 and 2 overlap, so either pop
+# order is fine.
+0 push 1 100 140
+1 push 2 110 150
+2 pop 2 160 170
+2 pop 1 180 190
+2 pop empty 200 210

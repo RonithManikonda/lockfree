@@ -1,0 +1,14 @@
+# Thread 0 pushes 3 strictly before 4 (no overlap), yet thread 2 pops 4
+# first. Values 1, 2, 5 and 6 are noise the minimizer should drop.
+0 push 1 100 110
+1 push 2 105 115
+2 pop 1 120 130
+2 pop 2 135 140
+0 push 3 150 160
+0 push 4 170 180
+1 push 5 175 185
+2 pop 4 190 200
+2 pop 3 205 210
+2 pop 5 215 220
+1 push 6 230 240
+2 pop 6 250 260

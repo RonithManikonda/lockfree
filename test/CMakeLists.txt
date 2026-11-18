@@ -26,6 +26,7 @@ set(LOCKFREE_TESTS
   test_lin_checker
   test_lin_catalog
   test_lin_stress
+  test_lin_log
 )
 
 foreach(test ${LOCKFREE_TESTS})
@@ -42,7 +43,9 @@ target_include_directories(test_latency_histogram PRIVATE ${PROJECT_SOURCE_DIR}/
 
 # Linearizability history model, specs, recorder and checker (header-only under tools/).
 # `ctest -L linearizability` runs just these.
-foreach(test test_lin_history test_lin_recorder test_lin_checker test_lin_catalog test_lin_stress)
+foreach(test test_lin_history test_lin_recorder test_lin_checker test_lin_catalog test_lin_stress
+            test_lin_log)
   target_include_directories(${test} PRIVATE ${PROJECT_SOURCE_DIR}/tools)
   set_tests_properties(${test} PROPERTIES LABELS linearizability)
 endforeach()
+
