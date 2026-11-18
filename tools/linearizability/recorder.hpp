@@ -58,6 +58,21 @@ public:
             return result;
         }
 
+        // Like pop(), but an empty result isn't recorded. For structures
+        // whose "empty" is only a hint: MPSC and MPMC can report empty while
+        // an earlier push that already returned is hidden behind a producer
+        // that stalled mid-push, which no sequential queue would do. Dropping
+        // those answers checks everything the structure does promise; an op
+        // that changed nothing and isn't in the history can't make it fail.
+        template <typename Fn>
+        std::optional<std::int64_t> pop_nonempty(Fn&& fn) {
+            const std::uint64_t invoke = now();
+            const std::optional<std::int64_t> result = std::forward<Fn>(fn)();
+            const std::uint64_t response = now();
+            if (result) ops_.push_back({thread_, OpKind::pop, 0, result, invoke, response});
+            return result;
+        }
+
         std::uint32_t thread() const noexcept { return thread_; }
         std::size_t size() const noexcept { return ops_.size(); }
         void reserve(std::size_t n) { ops_.reserve(n); }
@@ -122,7 +137,7 @@ public:
     }
 
 private:
-    struct alignas(detail::cache_line_size) Slot {
+    struct alignas(lockfree::detail::cache_line_size) Slot {
         ThreadLog log;
     };
 
