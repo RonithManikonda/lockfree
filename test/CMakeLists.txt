@@ -21,6 +21,7 @@ set(LOCKFREE_TESTS
   interleaving_test
   test_latency_histogram
   test_atomic_backoff
+  test_atomic_shim
   test_lin_history
   test_lin_recorder
   test_lin_checker
@@ -49,3 +50,9 @@ foreach(test test_lin_history test_lin_recorder test_lin_checker test_lin_catalo
   set_tests_properties(${test} PROPERTIES LABELS linearizability)
 endforeach()
 
+# The same shim test with LOCKFREE_SCHEDULER, where detail::atomic becomes the
+# yielding wrapper.
+add_executable(test_atomic_shim_sched test_atomic_shim.cpp)
+target_link_libraries(test_atomic_shim_sched PRIVATE lockfree GTest::gtest_main)
+target_compile_definitions(test_atomic_shim_sched PRIVATE LOCKFREE_SCHEDULER)
+add_test(NAME test_atomic_shim_sched COMMAND test_atomic_shim_sched)
