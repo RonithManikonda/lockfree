@@ -278,9 +278,24 @@ private:
         for (; end < ops.size() && ops[end].invoke_ts <= min_response; ++end) {
             if (!done.contains(end)) min_response = std::min(min_response, ops[end].response_ts);
         }
+        // Program order also rules: a thread does one call at a time, so its
+        // next op can't be linearized before its previous one, whatever the
+        // timestamps say. They often can't say: Apple Silicon's steady_clock
+        // ticks at 24 MHz, so back-to-back ops from one thread regularly share
+        // a timestamp and would otherwise look concurrent. Treating them as
+        // reorderable is wrong, and on a history that's actually broken it
+        // made the search try every permutation of each thread's tied runs
+        // before it could say so. sort_by_invoke is stable and the recorder
+        // appends in program order, so the first pending op per thread here is
+        // that thread's earliest.
         std::vector<std::size_t> out;
+        std::vector<std::uint32_t> blocked; // threads with an earlier pending op
         for (std::size_t i = first; i < end; ++i) {
-            if (!done.contains(i) && ops[i].invoke_ts <= min_response) out.push_back(i);
+            if (done.contains(i)) continue;
+            const std::uint32_t t = ops[i].thread;
+            if (std::find(blocked.begin(), blocked.end(), t) != blocked.end()) continue;
+            blocked.push_back(t);
+            if (ops[i].invoke_ts <= min_response) out.push_back(i);
         }
         std::stable_sort(out.begin(), out.end(), [&](std::size_t a, std::size_t b) {
             return ops[a].response_ts < ops[b].response_ts;

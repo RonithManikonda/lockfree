@@ -60,14 +60,17 @@ TEST(AtomicShim, HoldsPointersAndSmallStructs) {
     EXPECT_TRUE(p.compare_exchange_strong(want, &y));
     EXPECT_EQ(p.load(), &y);
 
+    // 8 bytes on purpose: a 16-byte struct needs libatomic (or -mcx16) on
+    // x86-64 and fails to link there. tagged_ptr.hpp only goes 16 bytes wide
+    // where that's lock-free, so the test shouldn't demand it either.
     struct Pair {
-        void* ptr;
-        std::uint64_t tag;
+        std::uint32_t index;
+        std::uint32_t tag;
     };
-    atomic<Pair> w{Pair{nullptr, 0}};
+    atomic<Pair> w{Pair{0, 0}};
     Pair cur = w.load();
-    EXPECT_TRUE(w.compare_exchange_strong(cur, Pair{&x, cur.tag + 1}));
-    EXPECT_EQ(w.load().ptr, &x);
+    EXPECT_TRUE(w.compare_exchange_strong(cur, Pair{7, cur.tag + 1}));
+    EXPECT_EQ(w.load().index, 7u);
     EXPECT_EQ(w.load().tag, 1u);
 }
 

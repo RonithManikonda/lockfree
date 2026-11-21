@@ -296,3 +296,36 @@ TEST(LinChecker, LongConcurrentHistoryChecksQuickly) {
     EXPECT_EQ(bad.verdict, Verdict::not_linearizable);
     EXPECT_FALSE(bad.failing_segment.empty());
 }
+
+namespace {
+
+// One thread's calls are ordered by program order even when the clock can't
+// tell them apart (Apple Silicon's steady_clock ticks every ~42 ns). By the
+// timestamps alone these pushes overlap and popping 2 first would be fine.
+TEST(LinChecker, SameThreadTiesKeepProgramOrder) {
+    History h({push(1, 10, 10), push(2, 10, 10), pop(2, 20, 21, 1)});
+    EXPECT_EQ(check<FifoQueueSpec>(h).verdict, Verdict::not_linearizable);
+
+    // Different threads with the same timestamps really are concurrent.
+    History concurrent({push(1, 10, 10), push(2, 10, 10, 2), pop(2, 20, 21, 1)});
+    EXPECT_EQ(check<FifoQueueSpec>(concurrent).verdict, Verdict::linearizable);
+}
+
+// Long tied runs from one thread used to be explored in every order before a
+// violation could be reported. In program order there's only one.
+TEST(LinChecker, TiedRunsDontBlowUpTheSearch) {
+    std::vector<Operation> ops;
+    constexpr std::int64_t n = 60;
+    for (std::int64_t i = 0; i < n; ++i) {
+        const auto ts = static_cast<std::uint64_t>(i / 4); // runs of four tied pushes
+        ops.push_back(push(i, ts, ts));
+    }
+    ops.push_back(pop(n - 1, 1000, 1001, 1)); // newest first: not a FIFO
+    CheckOptions opts;
+    opts.max_configurations = 10'000;
+    const auto r = check<FifoQueueSpec>(History(ops), opts);
+    EXPECT_EQ(r.verdict, Verdict::not_linearizable) << r.message;
+    EXPECT_LT(r.configurations, 1'000u);
+}
+
+} // namespace
