@@ -73,3 +73,12 @@ foreach(test test_spsc_ring_buffer test_mpmc_queue test_mpsc_queue test_atomic_s
   target_compile_definitions(${target} PRIVATE LOCKFREE_SCHEDULER LOCKFREE_TEST_HOOKS)
   add_test(NAME ${target} COMMAND ${target})
 endforeach()
+
+# Scheduler core: baton handoff, strategies, step limit. Links the scheduler
+# library, which brings LOCKFREE_SCHEDULER with it.
+if(LOCKFREE_BUILD_TOOLS)
+  add_executable(test_scheduler test_scheduler.cpp)
+  target_link_libraries(test_scheduler PRIVATE lockfree_scheduler GTest::gtest_main)
+  add_test(NAME test_scheduler COMMAND test_scheduler)
+  set_tests_properties(test_scheduler PROPERTIES LABELS scheduler)
+endif()

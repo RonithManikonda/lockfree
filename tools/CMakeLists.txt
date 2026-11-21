@@ -9,6 +9,9 @@ add_library(lockfree_scheduler STATIC
   scheduler/coverage.cpp)
 target_include_directories(lockfree_scheduler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(lockfree_scheduler PUBLIC lockfree)
+# The scheduler only exists for the yielding detail::atomic, so anything that
+# links it gets that build of the structures too.
+target_compile_definitions(lockfree_scheduler PUBLIC LOCKFREE_SCHEDULER)
 
 add_library(lockfree_linearizability STATIC
   linearizability/checker.cpp)
