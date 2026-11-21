@@ -6,6 +6,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "lockfree/detail/atomic_ref.hpp"
 #include "lockfree/detail/test_hook.hpp"
 
 // A Treiber stack with plain pointers, written the way it looks in a textbook
@@ -22,7 +23,7 @@ template <typename T>
 struct TreiberNode {
     // Atomic only so a racing reader of a recycled node isn't a C++ data race;
     // the ordering that matters is on the stack's head.
-    std::atomic<TreiberNode*> next{nullptr};
+    detail::atomic<TreiberNode*> next{nullptr};
     T value{};
 };
 
@@ -68,7 +69,7 @@ public:
     }
 
 private:
-    std::atomic<Node*> free_{nullptr};
+    detail::atomic<Node*> free_{nullptr};
     mutable std::mutex mutex_;
     std::vector<std::unique_ptr<Node>> all_;
 };
@@ -127,7 +128,7 @@ public:
 private:
     std::unique_ptr<NodePool<T>> own_pool_;
     NodePool<T>* pool_;
-    std::atomic<Node*> head_{nullptr};
+    detail::atomic<Node*> head_{nullptr};
 };
 
 } // namespace lockfree::naive

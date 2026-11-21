@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "lockfree/atomic_backoff.hpp"
+#include "lockfree/detail/atomic_ref.hpp"
 #include "lockfree/detail/cache_line.hpp"
 
 namespace lockfree {
@@ -169,7 +170,7 @@ private:
     static constexpr std::size_t mask = N - 1;
 
     struct Cell {
-        std::atomic<std::size_t> seq;
+        detail::atomic<std::size_t> seq;
         alignas(T) std::byte bytes[sizeof(T)];
 
         // launder: each lap constructs a new T in the same bytes.
@@ -261,8 +262,8 @@ private:
 
     // Producers hammer enqueue_pos_, consumers hammer dequeue_pos_; keep
     // them off each other's line and off the cells.
-    alignas(detail::cache_line_size) std::atomic<std::size_t> enqueue_pos_{0};
-    alignas(detail::cache_line_size) std::atomic<std::size_t> dequeue_pos_{0};
+    alignas(detail::cache_line_size) detail::atomic<std::size_t> enqueue_pos_{0};
+    alignas(detail::cache_line_size) detail::atomic<std::size_t> dequeue_pos_{0};
     alignas(detail::cache_line_size) Cell cells_[N];
 };
 

@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "lockfree/atomic_backoff.hpp"
+#include "lockfree/detail/atomic_ref.hpp"
 #include "lockfree/detail/cache_line.hpp"
 #include "lockfree/detail/tagged_ptr.hpp"
 #include "lockfree/detail/test_hook.hpp"
@@ -37,7 +38,7 @@ class AtomicStack {
     struct Node {
         // Atomic because a pop that is about to lose its CAS can read next
         // while the node's new owner writes it.
-        std::atomic<Node*> next{nullptr};
+        detail::atomic<Node*> next{nullptr};
         alignas(T) std::byte storage[sizeof(T)];
 
         T* value() noexcept { return std::launder(reinterpret_cast<T*>(storage)); }

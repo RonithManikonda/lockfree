@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "lockfree/atomic_backoff.hpp"
+#include "lockfree/detail/atomic_ref.hpp"
 #include "lockfree/detail/cache_line.hpp"
 
 namespace lockfree {
@@ -14,7 +15,7 @@ namespace lockfree {
 // allocates: a node is owned by the queue from push until pop returns it, and
 // can only be in one queue at a time.
 struct MpscNode {
-    std::atomic<MpscNode*> next{nullptr};
+    detail::atomic<MpscNode*> next{nullptr};
 };
 
 // Unbounded intrusive multi-producer / single-consumer queue (Dmitry Vyukov's
@@ -114,7 +115,7 @@ private:
 
     // Producers hammer tail_; only the consumer touches head_, so it's a plain
     // pointer. stub_ gets its own line because producers write to its next.
-    alignas(detail::cache_line_size) std::atomic<MpscNode*> tail_{&stub_};
+    alignas(detail::cache_line_size) detail::atomic<MpscNode*> tail_{&stub_};
     alignas(detail::cache_line_size) MpscNode* head_{&stub_};
     alignas(detail::cache_line_size) MpscNode stub_;
 };

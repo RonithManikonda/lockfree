@@ -3,6 +3,8 @@
 #include <cassert>
 #include <cstdint>
 
+#include "lockfree/detail/atomic_ref.hpp"
+
 namespace lockfree::detail {
 
 struct WideTaggedPair {
@@ -67,7 +69,7 @@ public:
     }
 
 private:
-    std::atomic<WideTaggedPair> word_{WideTaggedPair{nullptr, 0}};
+    atomic<WideTaggedPair> word_{WideTaggedPair{nullptr, 0}};
 };
 
 template <typename Node>
@@ -105,7 +107,7 @@ private:
                 word >> ptr_bits};
     }
 
-    std::atomic<std::uint64_t> word_{0};
+    atomic<std::uint64_t> word_{0};
 };
 
 } // namespace lockfree::detail

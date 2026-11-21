@@ -56,3 +56,20 @@ add_executable(test_atomic_shim_sched test_atomic_shim.cpp)
 target_link_libraries(test_atomic_shim_sched PRIVATE lockfree GTest::gtest_main)
 target_compile_definitions(test_atomic_shim_sched PRIVATE LOCKFREE_SCHEDULER)
 add_test(NAME test_atomic_shim_sched COMMAND test_atomic_shim_sched)
+
+# The structures' own suites again, with every atomic access going through the
+# yielding wrapper (no hook installed, so it only adds a null check). Shows the
+# port didn't change behaviour; test_shim_ported checks the yields themselves.
+foreach(test test_spsc_ring_buffer test_mpmc_queue test_mpsc_queue test_atomic_stack
+            test_shim_ported)
+  if(test STREQUAL "test_shim_ported")
+    set(target ${test})
+  else()
+    set(target ${test}_sched)
+  endif()
+  add_executable(${target} ${test}.cpp)
+  target_link_libraries(${target} PRIVATE lockfree GTest::gtest_main)
+  target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(${target} PRIVATE LOCKFREE_SCHEDULER LOCKFREE_TEST_HOOKS)
+  add_test(NAME ${target} COMMAND ${target})
+endforeach()

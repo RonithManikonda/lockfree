@@ -6,6 +6,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "lockfree/detail/atomic_ref.hpp"
 #include "lockfree/detail/cache_line.hpp"
 
 namespace lockfree {
@@ -160,10 +161,10 @@ private:
     //
     // Consumer's line: read_ is shared (the producer reloads it when the
     // queue looks full), write_cache_ is touched by the consumer only.
-    alignas(detail::cache_line_size) std::atomic<std::size_t> read_{0};
+    alignas(detail::cache_line_size) detail::atomic<std::size_t> read_{0};
     std::size_t write_cache_{0};
     // Producer's line.
-    alignas(detail::cache_line_size) std::atomic<std::size_t> write_{0};
+    alignas(detail::cache_line_size) detail::atomic<std::size_t> write_{0};
     std::size_t read_cache_{0};
     alignas(detail::cache_line_size) Slot buffer_[N];
 };
