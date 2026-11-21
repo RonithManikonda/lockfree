@@ -5,6 +5,7 @@
 
 add_library(lockfree_scheduler STATIC
   scheduler/scheduler.cpp
+  scheduler/explore.cpp
   scheduler/shrink.cpp
   scheduler/coverage.cpp)
 target_include_directories(lockfree_scheduler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
