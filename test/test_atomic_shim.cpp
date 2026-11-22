@@ -63,7 +63,12 @@ TEST(AtomicShim, HoldsPointersAndSmallStructs) {
     // 8 bytes on purpose: a 16-byte struct needs libatomic (or -mcx16) on
     // x86-64 and fails to link there. tagged_ptr.hpp only goes 16 bytes wide
     // where that's lock-free, so the test shouldn't demand it either.
-    struct Pair {
+    //
+    // alignas(8) too: clang decides inline-vs-libcall from the pointee's
+    // alignment, and two uint32_t only guarantee 4. libstdc++ over-aligns the
+    // atomic member, but its CAS goes through `__atomic_compare_exchange` on a
+    // `Pair*`, so clang on Linux still emits the generic libatomic call.
+    struct alignas(8) Pair {
         std::uint32_t index;
         std::uint32_t tag;
     };
