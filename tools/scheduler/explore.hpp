@@ -41,15 +41,26 @@ private:
     std::uint64_t state_;
 };
 
+// A strategy whose every choice follows from one 64-bit seed. explore() needs
+// that to report a failing run as a seed, and replay() to get it back.
+class SeededStrategy : public Strategy {
+public:
+    // Takes effect at the next begin_run.
+    virtual void reseed(std::uint64_t seed) noexcept = 0;
+
+    // For failure reports, so a seed is printed next to what it seeds.
+    virtual const char* name() const noexcept = 0;
+};
+
 // At every decision, picks uniformly among the runnable threads. Simple, and
 // good at shallow bugs (a preemption at one or two specific points); PCT does
 // better on deeper ones.
-class RandomStrategy : public Strategy {
+class RandomStrategy : public SeededStrategy {
 public:
     explicit RandomStrategy(std::uint64_t seed) noexcept : seed_(seed), rng_(seed) {}
 
-    // Takes effect at the next begin_run.
-    void reseed(std::uint64_t seed) noexcept { seed_ = seed; }
+    void reseed(std::uint64_t seed) noexcept override { seed_ = seed; }
+    const char* name() const noexcept override { return "random"; }
 
     void begin_run(std::size_t) override { rng_ = SplitMix64(seed_); }
 
@@ -88,12 +99,22 @@ struct ExploreResult {
 // they all completed.
 RunResult run_case(const CaseFactory& factory, Strategy& strategy, Options options = {});
 
-// Up to `iterations` runs under RandomStrategy. Stops at the first failure and
-// prints its message and replay seed to stderr.
+// Up to `iterations` runs, each with strategy reseeded to run_seed(seed, i).
+// Stops at the first failure and prints its message, the strategy's name and
+// the replay seed to stderr.
+ExploreResult explore(const CaseFactory& factory, SeededStrategy& strategy, std::size_t iterations,
+                      std::uint64_t seed, Options options = {});
+
+// The same under RandomStrategy.
 ExploreResult explore(const CaseFactory& factory, std::size_t iterations, std::uint64_t seed,
                       Options options = {});
 
-// Runs the case once with the schedule a run seed picks.
+// Runs the case once with the schedule a run seed picks. The strategy has to
+// be configured the way it was when the seed was printed.
+RunResult replay(const CaseFactory& factory, SeededStrategy& strategy, std::uint64_t run_seed,
+                 Options options = {});
+
+// The same under RandomStrategy.
 RunResult replay(const CaseFactory& factory, std::uint64_t run_seed, Options options = {});
 
 } // namespace lockfree::sched

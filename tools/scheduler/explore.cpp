@@ -31,10 +31,9 @@ RunResult run_case(const CaseFactory& factory, Strategy& strategy, Options optio
     return r;
 }
 
-ExploreResult explore(const CaseFactory& factory, std::size_t iterations, std::uint64_t seed,
-                      Options options) {
+ExploreResult explore(const CaseFactory& factory, SeededStrategy& strategy, std::size_t iterations,
+                      std::uint64_t seed, Options options) {
     ExploreResult result;
-    RandomStrategy strategy(seed);
     for (std::size_t i = 0; i < iterations; ++i) {
         const std::uint64_t s = run_seed(seed, i);
         strategy.reseed(s);
@@ -43,8 +42,8 @@ ExploreResult explore(const CaseFactory& factory, std::size_t iterations, std::u
         if (!r.ok()) {
             std::fprintf(stderr,
                          "lockfree::sched: run %zu of %zu failed after %" PRIu64
-                         " steps: %s\n  replay seed: 0x%016" PRIx64 "\n",
-                         i + 1, iterations, r.steps, r.failure.c_str(), s);
+                         " steps: %s\n  replay seed (%s): 0x%016" PRIx64 "\n",
+                         i + 1, iterations, r.steps, r.failure.c_str(), strategy.name(), s);
             result.failing_seed = s;
             result.failure = std::move(r);
             break;
@@ -53,9 +52,21 @@ ExploreResult explore(const CaseFactory& factory, std::size_t iterations, std::u
     return result;
 }
 
+ExploreResult explore(const CaseFactory& factory, std::size_t iterations, std::uint64_t seed,
+                      Options options) {
+    RandomStrategy strategy(seed);
+    return explore(factory, strategy, iterations, seed, options);
+}
+
+RunResult replay(const CaseFactory& factory, SeededStrategy& strategy, std::uint64_t seed,
+                 Options options) {
+    strategy.reseed(seed);
+    return run_case(factory, strategy, options);
+}
+
 RunResult replay(const CaseFactory& factory, std::uint64_t seed, Options options) {
     RandomStrategy strategy(seed);
-    return run_case(factory, strategy, options);
+    return replay(factory, strategy, seed, options);
 }
 
 } // namespace lockfree::sched

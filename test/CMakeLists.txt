@@ -77,7 +77,7 @@ endforeach()
 # Scheduler core (baton handoff, step limit) and random exploration. Links the scheduler
 # library, which brings LOCKFREE_SCHEDULER with it.
 if(LOCKFREE_BUILD_TOOLS)
-  foreach(test test_scheduler test_explore)
+  foreach(test test_scheduler test_explore test_pct)
     add_executable(${test} ${test}.cpp)
     target_link_libraries(${test} PRIVATE lockfree_scheduler GTest::gtest_main)
     add_test(NAME ${test} COMMAND ${test})
