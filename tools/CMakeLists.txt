@@ -8,7 +8,8 @@ add_library(lockfree_scheduler STATIC
   scheduler/explore.cpp
   scheduler/pct.cpp
   scheduler/shrink.cpp
-  scheduler/coverage.cpp)
+  scheduler/coverage.cpp
+  scheduler/exhaustive.cpp)
 target_include_directories(lockfree_scheduler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(lockfree_scheduler PUBLIC lockfree)
 # The scheduler only exists for the yielding detail::atomic, so anything that

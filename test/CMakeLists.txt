@@ -73,11 +73,12 @@ foreach(test test_spsc_ring_buffer test_mpmc_queue test_mpsc_queue test_atomic_s
   add_test(NAME ${target} COMMAND ${target})
 endforeach()
 
-# Scheduler core (baton handoff, step limit), random/PCT exploration, shrinking, coverage, and the scheduler run
-# against the real structures (interleaving_test). Links the scheduler library, which brings LOCKFREE_SCHEDULER
-# with it.
+# Scheduler core (baton handoff, step limit), random/PCT exploration, shrinking, coverage, bounded exhaustive
+# search, and the scheduler run against the real structures (interleaving_test). Links the scheduler library,
+# which brings LOCKFREE_SCHEDULER with it.
 if(LOCKFREE_BUILD_TOOLS)
-  foreach(test test_scheduler test_explore test_pct test_shrink test_coverage interleaving_test)
+  foreach(test test_scheduler test_explore test_pct test_shrink test_coverage test_exhaustive
+                interleaving_test)
     add_executable(${test} ${test}.cpp)
     target_link_libraries(${test} PRIVATE lockfree_scheduler GTest::gtest_main)
     add_test(NAME ${test} COMMAND ${test})
