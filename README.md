@@ -17,9 +17,10 @@ stress tests, linearizability checking, a deterministic scheduler) and a
 | Verification | `scripts/check.sh` (Debug, TSan, ASan, UBSan); CI on Linux gcc/clang and macOS arm64 |
 | `MpmcQueue<T, N>` | done: unit + producers x consumers stress tests, throughput bench, [design notes](docs/mpmc_queue.md) |
 | `MpscQueue<T>`, `MpscIntrusiveQueue` | done: unit + 1..8 producer stress tests, N:1 throughput bench, [design notes](docs/mpsc_queue.md) |
-| `AtomicStack<T>` | tagged-pointer head + node free list; ABA reproduced on `naive::TreiberStack` and shown fixed; 2..8 thread stress; bench vs a mutex stack; design notes still to come |
+| `AtomicStack<T>` | tagged-pointer head + node free list; ABA reproduced on `naive::TreiberStack` and shown fixed; 2..8 thread stress; bench vs a mutex stack, [design notes](docs/atomic_stack.md) |
 | Reclamation, primitives | not started (headers are stubs) |
-| Linearizability checker, adversarial scheduler | not started |
+| Linearizability checker (`tools/linearizability`) | done: Wing-Gong/Lowe checker run on recorded stress histories, `lin_check` CLI that shrinks failures |
+| Adversarial scheduler (`tools/scheduler`) | done: random, PCT and bounded exhaustive exploration, replayable seeds, shrinking, coverage; finds the Treiber ABA on its own, [design notes](docs/adversarial_scheduler.md) |
 
 ## Usage
 
