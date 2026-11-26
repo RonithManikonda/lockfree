@@ -16,6 +16,7 @@ set(LOCKFREE_BENCHMARKS
   bench_mpsc
   bench_mpmc
   bench_atomic_stack
+  bench_reclamation
   bench_reference
 )
 

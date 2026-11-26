@@ -249,20 +249,24 @@ inline constexpr std::size_t kCollectEvery = 64;
 // nest; only the outermost one pins and unpins.
 class EpochGuard {
 public:
-    EpochGuard() {
-        auto& ts = detail::epoch::thread_state();
-        if (ts.depth++ > 0) return;
-        if (ts.record == nullptr) ts.record = detail::epoch::domain().acquire();
-        detail::epoch::domain().pin(ts.record);
+    // The thread state is looked up once and kept: a thread_local with a
+    // destructor costs a call per access on macOS, so the destructor
+    // shouldn't pay for a second lookup.
+    EpochGuard() : ts_(detail::epoch::thread_state()) {
+        if (ts_.depth++ > 0) return;
+        if (ts_.record == nullptr) ts_.record = detail::epoch::domain().acquire();
+        detail::epoch::domain().pin(ts_.record);
     }
 
     ~EpochGuard() {
-        auto& ts = detail::epoch::thread_state();
-        if (--ts.depth == 0) detail::epoch::domain().unpin(ts.record);
+        if (--ts_.depth == 0) detail::epoch::domain().unpin(ts_.record);
     }
 
     EpochGuard(const EpochGuard&) = delete;
     EpochGuard& operator=(const EpochGuard&) = delete;
+
+private:
+    detail::epoch::ThreadState& ts_;
 };
 
 class Epoch {
