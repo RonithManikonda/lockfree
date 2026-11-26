@@ -231,7 +231,10 @@ public:
     T* protect(const detail::atomic<T*>& src) noexcept {
         T* p = src.load(std::memory_order_relaxed);
         for (;;) {
-            record_->hazard.store(p, std::memory_order_relaxed);
+            // Release for the same reason reset() is: re-protecting replaces
+            // the previous hazard, and a scanner that sees the new value may
+            // free the old object. Our reads of it must happen-before that.
+            record_->hazard.store(p, std::memory_order_release);
             LOCKFREE_TEST_HOOK("hazard_protect_before_validate");
             // Publishing isn't enough: between our load of src and the store
             // above, p may have been unlinked, retired, and scanned by a

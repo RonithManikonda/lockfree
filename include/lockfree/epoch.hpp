@@ -125,7 +125,14 @@ public:
         // The epoch read here may already be stale; that only makes this
         // thread hold the epoch back a little longer, never less.
         const std::uint64_t e = global_.load(std::memory_order_relaxed);
-        r->state.store(pinned_state(e), std::memory_order_relaxed);
+        // Release, not relaxed: a collector may next see this thread as
+        // "pinned at e" rather than the 0 its last unpin wrote, and that
+        // observation is what lets the epoch move past whatever the previous
+        // critical section read. A release store here carries those reads
+        // along (a relaxed one would break the chain from the unpin, and the
+        // fences alone don't give a happens-before edge, which is all TSan
+        // reasons with).
+        r->state.store(pinned_state(e), std::memory_order_release);
         // The pin has to be visible to collectors before this thread loads any
         // shared pointer, which is a store-load ordering: only a seq_cst fence
         // gives it. It pairs with the fence in try_advance(): either the
@@ -163,7 +170,11 @@ public:
     // the tag is at least the epoch of any thread that could still see it.
     std::uint64_t retire_epoch() noexcept {
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        return global_.load(std::memory_order_relaxed);
+        // Acquire, because retire() also uses this value to decide that an
+        // old bag has expired and free it. That decision needs the same
+        // happens-before chain as collect(): unpins -> the advancing CAS ->
+        // this load.
+        return global_.load(std::memory_order_acquire);
     }
 
     void orphan(Bag bag) {
