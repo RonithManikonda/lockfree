@@ -60,7 +60,7 @@ add_test(NAME test_atomic_shim_sched COMMAND test_atomic_shim_sched)
 # yielding wrapper (no hook installed, so it only adds a null check). Shows the
 # port didn't change behaviour; test_shim_ported checks the yields themselves.
 foreach(test test_spsc_ring_buffer test_mpmc_queue test_mpsc_queue test_atomic_stack
-            test_hazard_pointer test_shim_ported)
+            test_hazard_pointer test_epoch test_shim_ported)
   if(test STREQUAL "test_shim_ported")
     set(target ${test})
   else()
