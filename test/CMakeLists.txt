@@ -60,7 +60,7 @@ add_test(NAME test_atomic_shim_sched COMMAND test_atomic_shim_sched)
 # yielding wrapper (no hook installed, so it only adds a null check). Shows the
 # port didn't change behaviour; test_shim_ported checks the yields themselves.
 foreach(test test_spsc_ring_buffer test_mpmc_queue test_mpsc_queue test_atomic_stack
-            test_hazard_pointer test_epoch test_shim_ported)
+            test_hazard_pointer test_epoch test_michael_scott_queue test_shim_ported)
   if(test STREQUAL "test_shim_ported")
     set(target ${test})
   else()
@@ -78,7 +78,7 @@ endforeach()
 # which brings LOCKFREE_SCHEDULER with it.
 if(LOCKFREE_BUILD_TOOLS)
   foreach(test test_scheduler test_explore test_pct test_shrink test_coverage test_exhaustive
-                interleaving_test)
+                interleaving_test interleaving_msq_test)
     add_executable(${test} ${test}.cpp)
     target_link_libraries(${test} PRIVATE lockfree_scheduler GTest::gtest_main)
     add_test(NAME ${test} COMMAND ${test})
