@@ -14,6 +14,7 @@
 #include "linearizability/recorder.hpp"
 #include "linearizability/spec.hpp"
 #include "lockfree/atomic_stack.hpp"
+#include "lockfree/michael_scott_queue.hpp"
 #include "lockfree/mpmc_queue.hpp"
 #include "lockfree/mpsc_queue.hpp"
 #include "lockfree/spsc_ring_buffer.hpp"
@@ -204,6 +205,68 @@ TEST_F(LinStress, MpscQueueThreeProducers) {
         });
         const History h = rec.merge();
         ASSERT_EQ(h.size(), 2 * total);
+        expect_linearizable<FifoQueueSpec>(h);
+        if (HasFailure()) return;
+    }
+}
+
+// Unlike MPSC and MPMC, the Michael-Scott queue records its empty pops too: an
+// empty answer means head->next was null while head was still the head, i.e.
+// the queue really was empty at that instant, so it's a linearizable claim
+// even with several consumers and a producer stalled mid-push.
+TEST_F(LinStress, MichaelScottQueueTwoByTwo) {
+    constexpr std::size_t producers = 2;
+    constexpr std::size_t consumers = 2;
+    constexpr std::int64_t credit_limit = 4;
+    const std::uint64_t per_producer = 1000;
+    const std::uint64_t total = producers * per_producer;
+    for (std::uint64_t round = 0; round < rounds(); ++round) {
+        lockfree::MichaelScottQueue<std::int64_t> q;
+        // Unbounded, so credits keep it shallow (as for MPSC above).
+        std::atomic<std::int64_t> in_queue{0};
+        std::atomic<std::uint64_t> popped{0};
+        Recorder rec(producers + consumers, 4 * per_producer);
+        run_stress(producers + consumers, [&](std::size_t t, StressRng& rng) {
+            auto& log = rec.log(t);
+            if (t < producers) {
+                for (std::uint64_t i = 0; i < per_producer; ++i) {
+                    while (in_queue.load(std::memory_order_relaxed) >= credit_limit) {
+                        std::this_thread::yield();
+                    }
+                    in_queue.fetch_add(1, std::memory_order_relaxed);
+                    const std::int64_t v = value_for(t, i);
+                    log.push(v, [&] {
+                        q.push(v);
+                        return true;
+                    });
+                    maybe_delay(rng);
+                }
+            } else {
+                // Recording every empty pop would swamp the history while
+                // consumers wait, so only a few in a row get recorded; the
+                // rest are retried off the record.
+                int empties = 0;
+                while (!all_popped(popped, total)) {
+                    if (empties < 3) {
+                        if (log.pop([&] { return q.try_pop(); })) {
+                            popped.fetch_add(1, std::memory_order_relaxed);
+                            in_queue.fetch_sub(1, std::memory_order_relaxed);
+                            empties = 0;
+                        } else {
+                            ++empties;
+                        }
+                    } else if (log.pop_nonempty([&] { return q.try_pop(); })) {
+                        popped.fetch_add(1, std::memory_order_relaxed);
+                        in_queue.fetch_sub(1, std::memory_order_relaxed);
+                        empties = 0;
+                    } else {
+                        std::this_thread::yield();
+                    }
+                    maybe_delay(rng);
+                }
+            }
+        });
+        const History h = rec.merge();
         expect_linearizable<FifoQueueSpec>(h);
         if (HasFailure()) return;
     }
