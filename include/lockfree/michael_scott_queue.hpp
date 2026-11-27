@@ -11,6 +11,7 @@
 #include "lockfree/detail/atomic_ref.hpp"
 #include "lockfree/detail/cache_line.hpp"
 #include "lockfree/detail/test_hook.hpp"
+#include "lockfree/epoch.hpp"
 #include "lockfree/hazard_pointer.hpp"
 
 namespace lockfree {
@@ -82,6 +83,38 @@ struct HazardPointerReclaim {
     template <typename T>
     static void retire(T* p) {
         HazardPointer::retire(p);
+    }
+};
+
+// Epochs: the guard pins the thread for the whole operation, so protect() is
+// just an acquire load; nothing loaded while pinned can be freed until the
+// guard goes away. Cheaper per pointer, but a thread stalled inside an
+// operation holds back every node retired after it (docs/reclamation.md).
+//
+// retire() runs inside the operation's own guard. Epoch::retire nests its pin
+// under ours, and the occasional collect() it triggers is still correct while
+// pinned; our pin only delays what that collect can free by one operation.
+struct EpochReclaim {
+    class Guard {
+    public:
+        Guard() = default;
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+
+        template <typename T>
+        T* protect(std::size_t /*slot*/, const detail::atomic<T*>& src) noexcept {
+            // Acquire, for the same reason protect() above ends on one: the
+            // caller reads the node's next and value through this pointer.
+            return src.load(std::memory_order_acquire);
+        }
+
+    private:
+        EpochGuard pin_;
+    };
+
+    template <typename T>
+    static void retire(T* p) {
+        Epoch::retire(p);
     }
 };
 

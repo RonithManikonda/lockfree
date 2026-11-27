@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "lockfree/hazard_pointer.hpp"
@@ -19,7 +20,10 @@
 
 namespace {
 
+using lockfree::Epoch;
+using lockfree::EpochReclaim;
 using lockfree::HazardPointer;
+using lockfree::HazardPointerReclaim;
 using lockfree::MichaelScottQueue;
 using lockfree::test::maybe_delay;
 using lockfree::test::run_stress;
@@ -29,16 +33,49 @@ using lockfree::test::StressTest;
 using lockfree::test::Tracked;
 using lockfree::test::TrackedTest;
 
-TEST(MichaelScottQueue, PopOnNewQueueIsEmpty) {
-    MichaelScottQueue<int> q;
+// Every test runs once per reclamation policy. What differs is how a test
+// forces "free everything that's safe to free now".
+template <typename Reclaimer>
+struct Reclaim;
+
+template <>
+struct Reclaim<HazardPointerReclaim> {
+    static void drain() { HazardPointer::scan(); }
+    static std::size_t retired() { return HazardPointer::retired_count(); }
+};
+
+template <>
+struct Reclaim<EpochReclaim> {
+    // An epoch bag needs two advances; collect() makes at most one each.
+    static void drain() {
+        for (int i = 0; i < 3; ++i) Epoch::collect();
+    }
+    static std::size_t retired() { return Epoch::retired_count(); }
+};
+
+using Reclaimers = ::testing::Types<HazardPointerReclaim, EpochReclaim>;
+
+struct ReclaimerName {
+    template <typename R>
+    static std::string GetName(int) {
+        return std::is_same_v<R, EpochReclaim> ? "Epoch" : "Hazard";
+    }
+};
+
+template <typename Reclaimer>
+class MichaelScottQueueTest : public ::testing::Test {};
+TYPED_TEST_SUITE(MichaelScottQueueTest, Reclaimers, ReclaimerName);
+
+TYPED_TEST(MichaelScottQueueTest, PopOnNewQueueIsEmpty) {
+    MichaelScottQueue<int, TypeParam> q;
     EXPECT_FALSE(q.try_pop().has_value());
     int out = -1;
     EXPECT_FALSE(q.try_pop(out));
     EXPECT_EQ(out, -1);
 }
 
-TEST(MichaelScottQueue, FifoOrder) {
-    MichaelScottQueue<int> q;
+TYPED_TEST(MichaelScottQueueTest, FifoOrder) {
+    MichaelScottQueue<int, TypeParam> q;
     for (int i = 0; i < 100; ++i) q.push(i);
     for (int i = 0; i < 100; ++i) {
         auto v = q.try_pop();
@@ -48,8 +85,8 @@ TEST(MichaelScottQueue, FifoOrder) {
     EXPECT_FALSE(q.try_pop().has_value());
 }
 
-TEST(MichaelScottQueue, InterleavedPushPopNeverReordersOrLoses) {
-    MichaelScottQueue<int> q;
+TYPED_TEST(MichaelScottQueueTest, InterleavedPushPopNeverReordersOrLoses) {
+    MichaelScottQueue<int, TypeParam> q;
     int next_in = 0, next_out = 0;
     for (int round = 0; round < 1000; ++round) {
         for (int k = 0; k < round % 5 + 1; ++k) q.push(next_in++);
@@ -62,8 +99,8 @@ TEST(MichaelScottQueue, InterleavedPushPopNeverReordersOrLoses) {
     EXPECT_EQ(next_in, next_out);
 }
 
-TEST(MichaelScottQueue, MoveOnlyValues) {
-    MichaelScottQueue<std::unique_ptr<int>> q;
+TYPED_TEST(MichaelScottQueueTest, MoveOnlyValues) {
+    MichaelScottQueue<std::unique_ptr<int>, TypeParam> q;
     q.push(std::make_unique<int>(7));
     q.emplace(new int(8));
     auto a = q.try_pop();
@@ -74,30 +111,32 @@ TEST(MichaelScottQueue, MoveOnlyValues) {
     EXPECT_EQ(*b, 8);
 }
 
-TEST(MichaelScottQueue, BlockingPopReturnsWhatIsThere) {
-    MichaelScottQueue<std::string> q;
+TYPED_TEST(MichaelScottQueueTest, BlockingPopReturnsWhatIsThere) {
+    MichaelScottQueue<std::string, TypeParam> q;
     q.push("hello");
     EXPECT_EQ(q.pop(), "hello");
 }
 
-// Old heads go to the reclaimer, not straight to delete. Scanning after the
-// pops (no hazards held any more) frees them.
-TEST(MichaelScottQueue, PopsRetireTheOldDummies) {
-    HazardPointer::scan();
-    const std::size_t before = HazardPointer::retired_count();
-    MichaelScottQueue<int> q;
+// Old heads go to the reclaimer, not straight to delete. Draining after the
+// pops (no hazards held, nobody pinned) frees them.
+TYPED_TEST(MichaelScottQueueTest, PopsRetireTheOldDummies) {
+    Reclaim<TypeParam>::drain();
+    const std::size_t before = Reclaim<TypeParam>::retired();
+    MichaelScottQueue<int, TypeParam> q;
     for (int i = 0; i < 10; ++i) q.push(i);
     for (int i = 0; i < 10; ++i) ASSERT_TRUE(q.try_pop());
-    EXPECT_EQ(HazardPointer::retired_count(), before + 10);
-    HazardPointer::scan();
-    EXPECT_EQ(HazardPointer::retired_count(), 0u);
+    EXPECT_EQ(Reclaim<TypeParam>::retired(), before + 10);
+    Reclaim<TypeParam>::drain();
+    EXPECT_EQ(Reclaim<TypeParam>::retired(), 0u);
 }
 
+template <typename Reclaimer>
 class MichaelScottLifetime : public TrackedTest {};
+TYPED_TEST_SUITE(MichaelScottLifetime, Reclaimers, ReclaimerName);
 
-TEST_F(MichaelScottLifetime, EveryValueDestroyedExactlyOnce) {
+TYPED_TEST(MichaelScottLifetime, EveryValueDestroyedExactlyOnce) {
     {
-        MichaelScottQueue<Tracked> q;
+        MichaelScottQueue<Tracked, TypeParam> q;
         for (int i = 0; i < 20; ++i) q.emplace(i);
         for (int i = 0; i < 12; ++i) {
             auto v = q.try_pop();
@@ -106,16 +145,16 @@ TEST_F(MichaelScottLifetime, EveryValueDestroyedExactlyOnce) {
         }
         // 8 left for the destructor, and the dummy must not be destroyed as a T.
     }
-    HazardPointer::scan();
+    Reclaim<TypeParam>::drain();
 }
 
-TEST_F(MichaelScottLifetime, ThrowingConstructorLeavesQueueUnchanged) {
+TYPED_TEST(MichaelScottLifetime, ThrowingConstructorLeavesQueueUnchanged) {
     struct Boom {
         explicit Boom(bool t) {
             if (t) throw std::runtime_error("boom");
         }
     };
-    MichaelScottQueue<Boom> q;
+    MichaelScottQueue<Boom, TypeParam> q;
     q.emplace(false);
     EXPECT_THROW(q.emplace(true), std::runtime_error);
     EXPECT_TRUE(q.try_pop().has_value());
@@ -124,7 +163,7 @@ TEST_F(MichaelScottLifetime, ThrowingConstructorLeavesQueueUnchanged) {
 
 // An element whose move constructor uses another queue: the inner operation
 // runs while the outer one holds the thread's cached hazard slots, so it has
-// to take its own pair.
+// to take its own pair. (With epochs the inner guard just nests.)
 struct UsesQueue {
     MichaelScottQueue<int>* other;
     int value;
@@ -135,9 +174,9 @@ struct UsesQueue {
     }
 };
 
-TEST(MichaelScottQueue, NestedOperationsGetTheirOwnSlots) {
+TYPED_TEST(MichaelScottQueueTest, NestedOperationsGetTheirOwnSlots) {
     MichaelScottQueue<int> other;
-    MichaelScottQueue<UsesQueue> q;
+    MichaelScottQueue<UsesQueue, TypeParam> q;
     q.emplace(&other, 5);
     auto v = q.try_pop();
     ASSERT_TRUE(v);
@@ -147,10 +186,10 @@ TEST(MichaelScottQueue, NestedOperationsGetTheirOwnSlots) {
 
 // A dequeuer stalls right before its CAS while another thread empties the
 // queue and frees what it can. The stalled dequeuer's nodes are still
-// protected, so its CAS fails cleanly and it retries on live memory (ASan
-// would flag a use-after-free here).
-TEST(MichaelScottQueue, StalledDequeuerSurvivesAnotherDrainingTheQueue) {
-    MichaelScottQueue<int> q;
+// protected (hazards) or it is still pinned (epochs), so its CAS fails
+// cleanly and it retries on live memory (ASan would flag a use-after-free).
+TYPED_TEST(MichaelScottQueueTest, StalledDequeuerSurvivesAnotherDrainingTheQueue) {
+    MichaelScottQueue<int, TypeParam> q;
     for (int i = 0; i < 4; ++i) q.push(i);
     int calls = 0;
     std::vector<int> stolen;
@@ -158,7 +197,7 @@ TEST(MichaelScottQueue, StalledDequeuerSurvivesAnotherDrainingTheQueue) {
         if (where != "ms_dequeue_before_cas" || calls++ != 0) return;
         std::thread([&] {
             while (auto v = q.try_pop()) stolen.push_back(*v);
-            HazardPointer::scan();
+            Reclaim<TypeParam>::drain();
             q.push(100);
         }).join();
     });
@@ -170,8 +209,8 @@ TEST(MichaelScottQueue, StalledDequeuerSurvivesAnotherDrainingTheQueue) {
 
 // A producer that linked its node but hasn't swung tail_ yet. Other threads
 // must finish its work, not wait for it.
-TEST(MichaelScottQueue, LaggingTailIsHelpedForward) {
-    MichaelScottQueue<int> q;
+TYPED_TEST(MichaelScottQueueTest, LaggingTailIsHelpedForward) {
+    MichaelScottQueue<int, TypeParam> q;
     int calls = 0;
     lockfree::detail::ScopedTestHook hook([&](std::string_view where) {
         if (where != "ms_enqueue_after_link" || calls++ != 0) return;
@@ -197,22 +236,36 @@ constexpr std::uint64_t tag_seq(std::uint64_t v) { return v & 0xffffffffu; }
 struct Shape {
     std::size_t producers;
     std::size_t consumers;
+    bool epoch; // which reclaimer
 };
 
 std::string shape_name(const ::testing::TestParamInfo<Shape>& info) {
-    return std::to_string(info.param.producers) + "p" + std::to_string(info.param.consumers) + "c";
+    return std::string(info.param.epoch ? "Epoch_" : "Hazard_") + std::to_string(info.param.producers) +
+           "p" + std::to_string(info.param.consumers) + "c";
 }
 
 std::vector<Shape> all_shapes() {
     std::vector<Shape> shapes;
-    for (std::size_t p : {1, 2, 4}) {
-        for (std::size_t c : {1, 2, 4}) shapes.push_back({p, c});
+    for (bool epoch : {false, true}) {
+        for (std::size_t p : {1, 2, 4}) {
+            for (std::size_t c : {1, 2, 4}) shapes.push_back({p, c, epoch});
+        }
+        shapes.push_back({8, 8, epoch});
     }
-    shapes.push_back({8, 8});
     return shapes;
 }
 
 class MichaelScottShapes : public StressTest, public ::testing::WithParamInterface<Shape> {};
+
+// Runs body.template operator()<Reclaimer>() for the shape's reclaimer.
+template <typename Body>
+void with_reclaimer(const Shape& shape, Body&& body) {
+    if (shape.epoch) {
+        body.template operator()<EpochReclaim>();
+    } else {
+        body.template operator()<HazardPointerReclaim>();
+    }
+}
 
 // Every value comes out exactly once, and each consumer sees each producer's
 // values in the order they were pushed (FIFO per producer). Consumers spin on
@@ -220,40 +273,41 @@ class MichaelScottShapes : public StressTest, public ::testing::WithParamInterfa
 // help a lagging tail, and retire nodes that other consumers just protected:
 // under ASan that's where a reclamation bug turns into a use-after-free.
 TEST_P(MichaelScottShapes, ExactlyOnceAndPerProducerOrder) {
-    const auto [producers, consumers] = GetParam();
-    const std::uint64_t per_producer = scaled(20000);
-    const std::uint64_t total = producers * per_producer;
-    MichaelScottQueue<std::uint64_t> q;
+    with_reclaimer(GetParam(), [&]<typename Reclaimer>() {
+        const auto [producers, consumers, epoch] = GetParam();
+        const std::uint64_t per_producer = scaled(20000);
+        const std::uint64_t total = producers * per_producer;
+        MichaelScottQueue<std::uint64_t, Reclaimer> q;
 
-    std::vector<std::vector<std::atomic<std::uint8_t>>> seen(producers);
-    for (auto& row : seen) row = std::vector<std::atomic<std::uint8_t>>(per_producer);
-    std::atomic<std::uint64_t> consumed{0};
-    std::atomic<std::uint64_t> order_violations{0};
-    std::atomic<std::uint64_t> bad_values{0};
+        std::vector<std::vector<std::atomic<std::uint8_t>>> seen(producers);
+        for (auto& row : seen) row = std::vector<std::atomic<std::uint8_t>>(per_producer);
+        std::atomic<std::uint64_t> consumed{0};
+        std::atomic<std::uint64_t> order_violations{0};
+        std::atomic<std::uint64_t> bad_values{0};
 
-    run_stress(producers + consumers, [&](std::size_t index, StressRng& rng) {
-        if (index < producers) {
-            for (std::uint64_t s = 0; s < per_producer; ++s) {
-                q.push(make_tagged(index, s));
+        run_stress(producers + consumers, [&](std::size_t index, StressRng& rng) {
+            if (index < producers) {
+                for (std::uint64_t s = 0; s < per_producer; ++s) {
+                    q.push(make_tagged(index, s));
+                    maybe_delay(rng);
+                }
+                return;
+            }
+            std::vector<std::uint64_t> last(producers, 0);
+            while (consumed.load(std::memory_order_relaxed) < total) {
+                auto v = q.try_pop();
+                if (!v) continue;
+                consumed.fetch_add(1, std::memory_order_relaxed);
+                const std::uint64_t p = tag_producer(*v), s = tag_seq(*v);
+                if (p >= producers || s >= per_producer) {
+                    bad_values.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                if (s < last[p]) order_violations.fetch_add(1, std::memory_order_relaxed);
+                last[p] = s + 1;
+                seen[p][s].fetch_add(1, std::memory_order_relaxed);
                 maybe_delay(rng);
             }
-            return;
-        }
-        std::vector<std::uint64_t> last(producers, 0);
-        while (consumed.load(std::memory_order_relaxed) < total) {
-            auto v = q.try_pop();
-            if (!v) continue;
-            consumed.fetch_add(1, std::memory_order_relaxed);
-            const std::uint64_t p = tag_producer(*v), s = tag_seq(*v);
-            if (p >= producers || s >= per_producer) {
-                bad_values.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            if (s < last[p]) order_violations.fetch_add(1, std::memory_order_relaxed);
-            last[p] = s + 1;
-            seen[p][s].fetch_add(1, std::memory_order_relaxed);
-            maybe_delay(rng);
-        }
     });
 
     EXPECT_EQ(bad_values.load(), 0u);
@@ -270,44 +324,48 @@ TEST_P(MichaelScottShapes, ExactlyOnceAndPerProducerOrder) {
     }
     EXPECT_EQ(missing, 0u);
     EXPECT_EQ(duplicated, 0u);
+    });
 }
 
 // Every thread both pushes and pops, so the queue stays short and each node is
 // retired moments after it was linked. Blocking pop on the consumer side runs
 // the Backoff path too.
 TEST_P(MichaelScottShapes, MixedThreadsBlockingPop) {
-    const auto [producers, consumers] = GetParam();
-    const std::size_t threads = producers + consumers;
-    const std::uint64_t per_thread = scaled(10000);
-    MichaelScottQueue<std::uint64_t> q;
-    std::vector<std::atomic<std::uint8_t>> seen(threads * per_thread);
+    with_reclaimer(GetParam(), [&]<typename Reclaimer>() {
+        const auto [producers, consumers, epoch] = GetParam();
+        const std::size_t threads = producers + consumers;
+        const std::uint64_t per_thread = scaled(10000);
+        MichaelScottQueue<std::uint64_t, Reclaimer> q;
+        std::vector<std::atomic<std::uint8_t>> seen(threads * per_thread);
 
-    run_stress(threads, [&](std::size_t index, StressRng& rng) {
-        for (std::uint64_t i = 0; i < per_thread; ++i) {
-            q.push(index * per_thread + i);
-            // pop() can't hang: this thread's own push is still in the queue
-            // or was taken by someone who will push one back.
-            const std::uint64_t v = q.pop();
-            if (v < seen.size()) seen[v].fetch_add(1, std::memory_order_relaxed);
-            maybe_delay(rng);
-        }
+        run_stress(threads, [&](std::size_t index, StressRng& rng) {
+            for (std::uint64_t i = 0; i < per_thread; ++i) {
+                q.push(index * per_thread + i);
+                // pop() can't hang: this thread's own push is still in the queue
+                // or was taken by someone who will push one back.
+                const std::uint64_t v = q.pop();
+                if (v < seen.size()) seen[v].fetch_add(1, std::memory_order_relaxed);
+                maybe_delay(rng);
+            }
     });
 
     EXPECT_FALSE(q.try_pop().has_value());
     std::uint64_t wrong = 0;
     for (const auto& n : seen) wrong += n.load(std::memory_order_relaxed) != 1;
     EXPECT_EQ(wrong, 0u) << "values missing or popped more than once";
+    });
 }
 
 INSTANTIATE_TEST_SUITE_P(Shapes, MichaelScottShapes, ::testing::ValuesIn(all_shapes()), shape_name);
 
+template <typename Reclaimer>
 class MichaelScottTrackedThreads : public TrackedTest {
 protected:
     void TearDown() override {
         // Popped values are gone; nodes still waiting in retired lists hold no
         // values, so the live count must already be zero here.
         TrackedTest::TearDown();
-        if (HasFailure()) {
+        if (this->HasFailure()) {
             std::fprintf(stderr, "stress seed: LOCKFREE_SEED=%llu\n",
                          static_cast<unsigned long long>(lockfree::test::stress_seed()));
         }
@@ -316,12 +374,14 @@ protected:
 
 // Non-trivial values under contention: each is constructed once, moved out
 // once and destroyed once, including the ones left for the queue's destructor.
-TEST_F(MichaelScottTrackedThreads, NoLeaksOrDoubleDestroys) {
+TYPED_TEST_SUITE(MichaelScottTrackedThreads, Reclaimers, ReclaimerName);
+
+TYPED_TEST(MichaelScottTrackedThreads, NoLeaksOrDoubleDestroys) {
     constexpr std::size_t threads = 6;
     const std::uint64_t per_thread = scaled(5000);
     std::atomic<std::uint64_t> popped{0};
     {
-        MichaelScottQueue<Tracked> q;
+        MichaelScottQueue<Tracked, TypeParam> q;
         run_stress(threads, [&](std::size_t index, StressRng& rng) {
             for (std::uint64_t i = 0; i < per_thread; ++i) {
                 q.emplace(static_cast<int>(index));
